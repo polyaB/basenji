@@ -15,7 +15,7 @@
 import numpy as np
 import tensorflow as tf
 
-from basenji import layers
+from basenji.basenji import layers
 
 ############################################################
 # Convolution

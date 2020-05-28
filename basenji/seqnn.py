@@ -22,9 +22,9 @@ from natsort import natsorted
 import numpy as np
 import tensorflow as tf
 
-from basenji import blocks
-from basenji import layers
-from basenji import metrics
+from basenji.basenji import blocks
+from basenji.basenji import layers
+from basenji.basenji import metrics
 
 class SeqNN():
 
@@ -148,7 +148,9 @@ class SeqNN():
     for ho in self.head_output:
         self.models.append(tf.keras.Model(inputs=sequence, outputs=ho))
     self.model = self.models[0]
-    print(self.model.summary())
+    with open("/mnt/storage/home/psbelokopytova/nn_anopheles/model_test", "w") as f:
+      self.model.summary(print_fn=lambda x: f.write(x + '\n'))
+    # print(self.model.summary())
 
     ###################################################
     # track pooling/striding and cropping
