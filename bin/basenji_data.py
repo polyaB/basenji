@@ -29,6 +29,10 @@ import sys
 import tempfile
 import time
 
+source_path = os.path.dirname(os.path.abspath(sys.argv[0])) + "/../"
+sys.path.append(source_path)
+
+
 import h5py
 import numpy as np
 import pandas as pd

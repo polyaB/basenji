@@ -14,8 +14,12 @@
 # =========================================================================
 import numpy as np
 import tensorflow as tf
+import sys
+import os
+source_path = os.path.dirname(os.path.abspath(sys.argv[0])) + "/../../basenji/basenji"
+sys.path.append(source_path)
 
-from basenji.basenji import layers
+import layers
 
 ############################################################
 # Convolution

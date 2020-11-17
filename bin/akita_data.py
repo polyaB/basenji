@@ -21,7 +21,8 @@ import random
 import shutil
 import subprocess
 import sys
-
+source_path = os.path.dirname(os.path.abspath(sys.argv[0])) + "/../"
+sys.path.append(source_path)
 import numpy as np
 import pandas as pd
 
@@ -325,7 +326,7 @@ def main():
     if options.restart and os.path.isfile(seqs_cov_file):
       print('Skipping existing %s' % seqs_cov_file, file=sys.stderr)
     else:
-      cmd = 'akita_data_read.py'
+      cmd = 'python ~/nn_anopheles/basenji/bin/akita_data_read.py'
       cmd += ' --crop %d' % options.crop_bp
       cmd += ' -k %d' % options.kernel_stddev
       cmd += ' -w %d' % options.pool_width
@@ -390,7 +391,7 @@ def main():
     while tfr_start <= tvt_set_end:
       tfr_stem = '%s/%s-%d' % (tfr_dir, tvt_set, tfr_i)
 
-      cmd = 'basenji_data_write.py'
+      cmd = 'python ~/nn_anopheles/basenji/bin/basenji_data_write.py'
       cmd += ' -s %d' % tfr_start
       cmd += ' -e %d' % tfr_end
 

@@ -28,6 +28,9 @@ import tensorflow as tf
 if tf.__version__[0] == '1':
   tf.compat.v1.enable_eager_execution()
 
+source_path = os.path.dirname(os.path.abspath(sys.argv[0])) + "/../"
+sys.path.append(source_path)
+
 from basenji import dataset
 from basenji import seqnn
 from basenji import trainer

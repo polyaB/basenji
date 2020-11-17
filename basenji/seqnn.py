@@ -16,15 +16,17 @@ from __future__ import print_function
 
 import pdb
 import sys
+import os
 import time
-
+source_path = os.path.dirname(os.path.abspath(sys.argv[0])) + "/../../basenji/basenji"
+sys.path.append(source_path)
 from natsort import natsorted
 import numpy as np
 import tensorflow as tf
 
-from basenji.basenji import blocks
-from basenji.basenji import layers
-from basenji.basenji import metrics
+import blocks
+import layers
+import metrics
 
 class SeqNN():
 
