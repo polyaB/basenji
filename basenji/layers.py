@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # =========================================================================
+import pdb
 import sys
 
 import numpy as np
@@ -41,16 +42,48 @@ class Clip(tf.keras.layers.Layer):
     return config
 
 class Exp(tf.keras.layers.Layer):
-    def __init__(self):
-        super(Exp, self).__init__()
-    def call(self, x):
-      return tf.keras.activations.exponential(x)
+  def __init__(self, base=None, minus=None):
+    super(Exp, self).__init__()
+    if base is None:
+      self.base = None
+    else:
+      self.base = tf.constant(base, dtype=tf.float32)
+    if minus is None:
+      self.minus = None
+    else:
+      self.minus = tf.constant(minus, dtype=tf.float32)
+
+  def call(self, x):
+    if self.base is None:
+      y = tf.keras.activations.exponential(x)
+    else:
+      y = tf.math.pow(self.base, x)
+
+    if self.minus is not None:
+      y -= self.minus
+
+    return y
+  def get_config(self):
+    config = super().get_config().copy()
+    config['base'] = self.base
+    config['minus'] = self.minus
+    return config
+
+class PolyReLU(tf.keras.layers.Layer):
+  def __init__(self, shift=0):
+    super(PolyReLU, self).__init__()
+
+  def call(self, x):
+    x3 = tf.math.pow((x-2), 3)
+    y = tf.keras.activations.relu(x3)
+    return y
 
 class GELU(tf.keras.layers.Layer):
-    def __init__(self):
-        super(GELU, self).__init__()
-    def call(self, x):
-        return tf.keras.activations.sigmoid(1.702 * x) * x
+  def __init__(self, **kwargs):
+    super(GELU, self).__init__(**kwargs)
+  def call(self, x):
+    # return tf.keras.activations.sigmoid(1.702 * x) * x
+    return tf.keras.activations.sigmoid(tf.constant(1.702) * x) * x
 
 class Softplus(tf.keras.layers.Layer):
   def __init__(self, exp_max=10000):
@@ -512,6 +545,10 @@ class UpperTri(tf.keras.layers.Layer):
     seq_len = inputs.shape[1]
     output_dim = inputs.shape[-1]
 
+    if type(seq_len) == tf.compat.v1.Dimension:
+      seq_len = seq_len.value
+      output_dim = output_dim.value
+
     triu_tup = np.triu_indices(seq_len, self.diagonal_offset)
     triu_index = list(triu_tup[0]+ seq_len*triu_tup[1])
     unroll_repr = tf.reshape(inputs, [-1, seq_len**2, output_dim])
@@ -596,6 +633,8 @@ class SwitchReverseTriu(tf.keras.layers.Layer):
 
     # infer original sequence length
     ut_len = x_ut.shape[1]
+    if type(ut_len) == tf.compat.v1.Dimension:
+      ut_len = ut_len.value
     seq_len = int(np.sqrt(2*ut_len + 0.25) - 0.5)
     seq_len += self.diagonal_offset
 
@@ -714,6 +753,26 @@ def shift_sequence(seq, shift, pad_value=0.25):
 
   return sseq
 
+############################################################
+# Factorization
+############################################################
+
+class FactorInverse(tf.keras.layers.Layer):
+  """Inverse a target matrix factorization."""
+  def __init__(self, components_npy):
+    super(FactorInverse, self).__init__()
+    self.components_npy = components_npy
+    self.components = tf.constant(np.load(components_npy), dtype=tf.float32)
+
+  def call(self, W):
+    return tf.keras.backend.dot(W, self.components)
+
+  def get_config(self):
+    config = super().get_config().copy()
+    config.update({
+      'components_npy': self.components_npy
+    })
+    return config
 
 ############################################################
 # helpers
@@ -723,6 +782,8 @@ def activate(current, activation, verbose=False):
   if verbose: print('activate:',activation)
   if activation == 'relu':
     current = tf.keras.layers.ReLU()(current)
+  elif activation == 'polyrelu':
+    current = PolyReLU()(current)
   elif activation == 'gelu':
     current = GELU()(current)
   elif activation == 'sigmoid':

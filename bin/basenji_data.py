@@ -17,6 +17,7 @@ from __future__ import print_function
 
 from optparse import OptionParser
 import collections
+import gzip
 import heapq
 import json
 import math
@@ -66,6 +67,9 @@ def main():
   parser.add_option('-d', dest='sample_pct',
       default=1.0, type='float',
       help='Down-sample the segments')
+  parser.add_option('-f', dest='folds',
+      default=None, type='int',
+      help='Generate cross fold split [Default: %default]')
   parser.add_option('-g', dest='gaps_file',
       help='Genome assembly gaps BED [Default: %default]')
   parser.add_option('-i', dest='interp_nan',
@@ -85,44 +89,50 @@ def main():
   parser.add_option('-p', dest='processes',
       default=None, type='int',
       help='Number parallel processes [Default: %default]')
+  parser.add_option('--peaks', dest='peaks_only',
+      default=False, action='store_true',
+      help='Create contigs only from peaks [Default: %default]') 
   parser.add_option('-r', dest='seqs_per_tfr',
       default=256, type='int',
       help='Sequences per TFRecord file [Default: %default]')
   parser.add_option('--restart', dest='restart',
       default=False, action='store_true',
-      help='Skip already read HDF5 coverage values. [Default: %default]')
+      help='Continue progress from midpoint. [Default: %default]')
   parser.add_option('--seed', dest='seed',
       default=44, type='int',
       help='Random seed [Default: %default]')
-  parser.add_option('--stride_train', dest='stride_train',
+  parser.add_option('--snap', dest='snap',
+      default=1, type='int',
+      help='Snap sequences to multiple of the given value [Default: %default]')
+  parser.add_option('--st', '--split_test', dest='split_test',
+      default=False, action='store_true',
+      help='Exit after split. [Default: %default]')
+  parser.add_option('--stride', '--stride_train', dest='stride_train',
       default=1., type='float',
       help='Stride to advance train sequences [Default: seq_length]')
   parser.add_option('--stride_test', dest='stride_test',
       default=1., type='float',
       help='Stride to advance valid and test sequences [Default: seq_length]')
-  parser.add_option('--soft', dest='soft_clip',
-      default=False, action='store_true',
-      help='Soft clip values, applying sqrt to the execess above the threshold [Default: %default]')
   parser.add_option('-t', dest='test_pct_or_chr',
       default=0.05, type='str',
       help='Proportion of the data for testing [Default: %default]')
   parser.add_option('-u', dest='umap_bed',
       help='Unmappable regions in BED format')
   parser.add_option('--umap_t', dest='umap_t',
-      default=0.3, type='float',
+      default=0.5, type='float',
       help='Remove sequences with more than this unmappable bin % [Default: %default]')
-  parser.add_option('--umap_set', dest='umap_set',
-      default=None, type='float',
-      help='Set unmappable regions to this percentile in the sequences\' distribution of values')
+  parser.add_option('--umap_clip', dest='umap_clip',
+      default=1, type='float',
+      help='Clip values at unmappable positions to distribution quantiles, eg 0.25. [Default: %default]')
+  parser.add_option('--umap_tfr', dest='umap_tfr',
+      default=False, action='store_true',
+      help='Save umap array into TFRecords [Default: %default]')
   parser.add_option('-w', dest='pool_width',
       default=128, type='int',
       help='Sum pool width [Default: %default]')
   parser.add_option('-v', dest='valid_pct_or_chr',
       default=0.05, type='str',
       help='Proportion of the data for validation [Default: %default]')
-  parser.add_option('--snap', dest='snap',
-      default=None, type='int',
-      help='Snap sequences to multiple of the given value [Default: %default]')
   (options, args) = parser.parse_args()
 
   if len(args) != 2:
@@ -141,11 +151,13 @@ def main():
     print(' converted to %f' % options.stride_train)
   options.stride_train = int(np.round(options.stride_train))
   if options.stride_test <= 1:
-    print('stride_test %.f'%options.stride_test, end='')
-    options.stride_test = options.stride_test*options.seq_length
-    print(' converted to %f' % options.stride_test)
+    if options.folds is None:
+      print('stride_test %.f'%options.stride_test, end='')
+      options.stride_test = options.stride_test*options.seq_length
+      print(' converted to %f' % options.stride_test)
   options.stride_test = int(np.round(options.stride_test))
 
+  # check snap
   if options.snap is not None:
     if np.mod(options.seq_length, options.snap) != 0: 
       raise ValueError('seq_length must be a multiple of snap')
@@ -154,11 +166,15 @@ def main():
     if np.mod(options.stride_test, options.snap) != 0:
       raise ValueError('stride_test must be a multiple of snap')
 
+  # setup output directory
   if os.path.isdir(options.out_dir) and not options.restart:
     print('Remove output directory %s or use --restart option.' % options.out_dir)
     exit(1)
   elif not os.path.isdir(options.out_dir):
     os.mkdir(options.out_dir)
+
+  # read target datasets
+  targets_df = pd.read_csv(targets_file, index_col=0, sep='\t')
 
   ################################################################
   # define genomic contigs
@@ -181,6 +197,11 @@ def main():
     if options.limit_bed is not None:
       contigs = limit_contigs(contigs, options.limit_bed)
 
+    # limit to peaks
+    if options.peaks_only:
+      peaks_bed = curate_peaks(targets_df, options.out_dir, options.pool_width, options.crop_bp)
+      contigs = limit_contigs(contigs, peaks_bed)
+
     # filter for large enough
     contigs = [ctg for ctg in contigs if ctg.end - ctg.start >= options.seq_length]
 
@@ -189,59 +210,84 @@ def main():
       contigs = break_large_contigs(contigs, options.break_t)
 
     # print contigs to BED file
-    ctg_bed_file = '%s/contigs.bed' % options.out_dir
-    write_seqs_bed(ctg_bed_file, contigs)
+    # ctg_bed_file = '%s/contigs.bed' % options.out_dir
+    # write_seqs_bed(ctg_bed_file, contigs)
 
 
   ################################################################
   # divide between train/valid/test
   ################################################################
+  # label folds
+  if options.folds is not None:
+    fold_labels = ['fold%d' % fi for fi in range(options.folds)]
+    num_folds = options.folds
+  else:
+    fold_labels = ['train', 'valid', 'test']
+    num_folds = 3
+
   if not options.restart:
-    try:
-      # convert to float pct
-      valid_pct = float(options.valid_pct_or_chr)
-      test_pct = float(options.test_pct_or_chr)
-      assert(0 <= valid_pct <= 1)
-      assert(0 <= test_pct <= 1)
+    if options.folds is not None:
+      # divide by fold pct
+      fold_contigs = divide_contigs_folds(contigs, options.folds)
 
-      # divide by pct
-      contig_sets = divide_contigs_pct(contigs, test_pct, valid_pct)
+    else:
+      try:
+        # convert to float pct
+        valid_pct = float(options.valid_pct_or_chr)
+        test_pct = float(options.test_pct_or_chr)
+        assert(0 <= valid_pct <= 1)
+        assert(0 <= test_pct <= 1)
 
-    except (ValueError, AssertionError):
-      # divide by chr
-      valid_chrs = options.valid_pct_or_chr.split(',')
-      test_chrs = options.test_pct_or_chr.split(',')
-      contig_sets = divide_contigs_chr(contigs, test_chrs, valid_chrs)
+        # divide by pct
+        fold_contigs = divide_contigs_pct(contigs, test_pct, valid_pct)
 
-    train_contigs, valid_contigs, test_contigs = contig_sets
+      except (ValueError, AssertionError):
+        # divide by chr
+        valid_chrs = options.valid_pct_or_chr.split(',')
+        test_chrs = options.test_pct_or_chr.split(',')
+        fold_contigs = divide_contigs_chr(contigs, test_chrs, valid_chrs)
 
     # rejoin broken contigs within set
-    train_contigs = rejoin_large_contigs(train_contigs)
-    valid_contigs = rejoin_large_contigs(valid_contigs)
-    test_contigs = rejoin_large_contigs(test_contigs)
+    for fi in range(len(fold_contigs)):
+      fold_contigs[fi] = rejoin_large_contigs(fold_contigs[fi])
+
+    # write labeled contigs to BED file
+    ctg_bed_file = '%s/contigs.bed' % options.out_dir
+    ctg_bed_out = open(ctg_bed_file, 'w')
+    for fi in range(len(fold_contigs)):
+      for ctg in fold_contigs[fi]:
+        line = '%s\t%d\t%d\t%s' % (ctg.chr, ctg.start, ctg.end, fold_labels[fi])
+        print(line, file=ctg_bed_out)
+    ctg_bed_out.close()
+
+  if options.split_test:
+    exit()
 
   ################################################################
   # define model sequences
   ################################################################
   if not options.restart:
-    # stride sequences across contig
-    train_mseqs = contig_sequences(train_contigs, options.seq_length, options.stride_train, options.snap, label='train')
-    valid_mseqs = contig_sequences(valid_contigs, options.seq_length, options.stride_test, options.snap, label='valid')
-    test_mseqs = contig_sequences(test_contigs, options.seq_length, options.stride_test, options.snap, label='test')
+    fold_mseqs = []
+    for fi in range(num_folds):
+      if fold_labels[fi] in ['valid','test']:
+        stride_fold = options.stride_test
+      else:
+        stride_fold = options.stride_train
 
-    # shuffle
-    random.shuffle(train_mseqs)
-    random.shuffle(valid_mseqs)
-    random.shuffle(test_mseqs)
+      # stride sequences across contig
+      fold_mseqs_fi = contig_sequences(fold_contigs[fi], options.seq_length,
+                                       stride_fold, options.snap, fold_labels[fi])
+      fold_mseqs.append(fold_mseqs_fi)
 
-    # down-sample
-    if options.sample_pct < 1.0:
-      train_mseqs = random.sample(train_mseqs, int(options.sample_pct*len(train_mseqs)))
-      valid_mseqs = random.sample(valid_mseqs, int(options.sample_pct*len(valid_mseqs)))
-      test_mseqs = random.sample(test_mseqs, int(options.sample_pct*len(test_mseqs)))
+      # shuffle
+      random.shuffle(fold_mseqs[fi])
 
-    # merge
-    mseqs = train_mseqs + valid_mseqs + test_mseqs
+      # down-sample
+      if options.sample_pct < 1.0:
+        fold_mseqs[fi] = random.sample(fold_mseqs[fi], int(options.sample_pct*len(fold_mseqs[fi])))
+
+    # merge into one list
+    mseqs = [ms for fm in fold_mseqs for ms in fm]
 
 
   ################################################################
@@ -254,8 +300,8 @@ def main():
         exit(1)
 
       # annotate unmappable positions
-      mseqs_unmap = annotate_unmap(mseqs, options.umap_bed,
-                                   options.seq_length, options.pool_width)
+      mseqs_unmap = annotate_unmap(mseqs, options.umap_bed, options.seq_length,
+                                   options.pool_width, options.crop_bp)
 
       # filter unmappable
       mseqs_map_mask = (mseqs_unmap.mean(axis=1, dtype='float64') < options.umap_t)
@@ -275,26 +321,26 @@ def main():
     seqs_bed_file = '%s/sequences.bed' % options.out_dir
     unmap_npy = '%s/mseqs_unmap.npy' % options.out_dir
     mseqs = []
-    train_mseqs = []
-    valid_mseqs = []
-    test_mseqs = []
+    fold_mseqs = []
+    for fi in range(num_folds):
+      fold_mseqs.append([])
     for line in open(seqs_bed_file):
       a = line.split()
       msg = ModelSeq(a[0], int(a[1]), int(a[2]), a[3])
       mseqs.append(msg)
       if a[3] == 'train':
-        train_mseqs.append(msg)
+        fi = 0
       elif a[3] == 'valid':
-        valid_mseqs.append(msg)
+        fi = 1
+      elif a[3] == 'test':
+        fi = 2
       else:
-        test_mseqs.append(msg)
+        fi = int(a[3].replace('fold',''))
+      fold_mseqs[fi].append(msg)
         
   ################################################################
   # read sequence coverage values
   ################################################################
-  # read target datasets
-  targets_df = pd.read_csv(targets_file, index_col=0, sep='\t')
-
   seqs_cov_dir = '%s/seqs_cov' % options.out_dir
   if not os.path.isdir(seqs_cov_dir):
     os.mkdir(seqs_cov_dir)
@@ -310,6 +356,10 @@ def main():
     if 'clip' in targets_df.columns:
       clip_ti = targets_df['clip'].iloc[ti]
 
+    clipsoft_ti = None
+    if 'clip_soft' in targets_df.columns:
+      clipsoft_ti = targets_df['clip_soft'].iloc[ti]
+
     scale_ti = 1
     if 'scale' in targets_df.columns:
       scale_ti = targets_df['scale'].iloc[ti]
@@ -323,8 +373,8 @@ def main():
       cmd += ' -u %s' % targets_df['sum_stat'].iloc[ti]
       if clip_ti is not None:
         cmd += ' -c %f' % clip_ti
-      if options.soft_clip:
-        cmd += ' --soft'
+      if clipsoft_ti is not None:
+        cmd += ' --clip_soft %f' % clipsoft_ti
       cmd += ' -s %f' % scale_ti
       if options.blacklist_bed:
         cmd += ' -b %s' % options.blacklist_bed
@@ -365,25 +415,26 @@ def main():
 
   write_jobs = []
 
-  for tvt_set in ['train', 'valid', 'test']:
-    tvt_set_indexes = [i for i in range(len(mseqs)) if mseqs[i].label == tvt_set]
-    tvt_set_start = tvt_set_indexes[0]
-    tvt_set_end = tvt_set_indexes[-1] + 1
+  for fold_set in fold_labels:
+    fold_set_indexes = [i for i in range(len(mseqs)) if mseqs[i].label == fold_set]
+    fold_set_start = fold_set_indexes[0]
+    fold_set_end = fold_set_indexes[-1] + 1
 
     tfr_i = 0
-    tfr_start = tvt_set_start
-    tfr_end = min(tfr_start+options.seqs_per_tfr, tvt_set_end)
+    tfr_start = fold_set_start
+    tfr_end = min(tfr_start+options.seqs_per_tfr, fold_set_end)
 
-    while tfr_start <= tvt_set_end:
-      tfr_stem = '%s/%s-%d' % (tfr_dir, tvt_set, tfr_i)
+    while tfr_start <= fold_set_end:
+      tfr_stem = '%s/%s-%d' % (tfr_dir, fold_set, tfr_i)
 
       cmd = 'basenji_data_write.py'
       cmd += ' -s %d' % tfr_start
       cmd += ' -e %d' % tfr_end
+      cmd += ' --umap_clip %f' % options.umap_clip
+      if options.umap_tfr:
+        cmd += ' --umap_tfr'
       if options.umap_bed is not None:
         cmd += ' -u %s' % unmap_npy
-      if options.umap_set is not None:
-        cmd += ' --umap_set %f' % options.umap_set
 
       cmd += ' %s' % fasta_file
       cmd += ' %s' % seqs_bed_file
@@ -396,7 +447,7 @@ def main():
         write_jobs.append(cmd)
       else:
         j = slurm.Job(cmd,
-              name='write_%s-%d' % (tvt_set, tfr_i),
+              name='write_%s-%d' % (fold_set, tfr_i),
               out_file='%s.out' % tfr_stem,
               err_file='%s.err' % tfr_stem,
               queue='standard', mem=15000, time='12:0:0')
@@ -405,7 +456,7 @@ def main():
       # update
       tfr_i += 1
       tfr_start += options.seqs_per_tfr
-      tfr_end = min(tfr_start+options.seqs_per_tfr, tvt_set_end)
+      tfr_end = min(tfr_start+options.seqs_per_tfr, fold_set_end)
 
   if options.run_local:
     util.exec_par(write_jobs, options.processes, verbose=True)
@@ -419,9 +470,6 @@ def main():
   ################################################################
   stats_dict = {}
   stats_dict['num_targets'] = targets_df.shape[0]
-  stats_dict['train_seqs'] = len(train_mseqs)
-  stats_dict['valid_seqs'] = len(valid_mseqs)
-  stats_dict['test_seqs'] = len(test_mseqs)
   stats_dict['seq_length'] = options.seq_length
   stats_dict['pool_width'] = options.pool_width
   stats_dict['crop_bp'] = options.crop_bp
@@ -430,12 +478,15 @@ def main():
   target_length = target_length // options.pool_width
   stats_dict['target_length'] = target_length
 
+  for fi in range(num_folds):
+    stats_dict['%s_seqs' % fold_labels[fi]] = len(fold_mseqs[fi])
+
   with open('%s/statistics.json' % options.out_dir, 'w') as stats_json_out:
     json.dump(stats_dict, stats_json_out, indent=4)
 
 
 ################################################################################
-def annotate_unmap(mseqs, unmap_bed, seq_length, pool_width):
+def annotate_unmap(mseqs, unmap_bed, seq_length, pool_width, crop_bp):
   """ Intersect the sequence segments with unmappable regions
          and annoate the segments as NaN to possible be ignored.
 
@@ -444,6 +495,7 @@ def annotate_unmap(mseqs, unmap_bed, seq_length, pool_width):
       unmap_bed: unmappable regions BED file
       seq_length: sequence length
       pool_width: pooled bin width
+      crop_bp: nucleotides cropped off ends
 
     Returns:
       seqs_unmap: NxL binary NA indicators
@@ -489,17 +541,22 @@ def annotate_unmap(mseqs, unmap_bed, seq_length, pool_width):
     first_start = seq_start + pool_seq_unmap_start * pool_width
     first_end = first_start + pool_width
     first_overlap = first_end - overlap_start
-    if first_overlap < 0.2 * pool_width:
+    if first_overlap < 0.1 * pool_width:
       pool_seq_unmap_start += 1
 
     # skip minor overlaps to the last
     last_start = seq_start + (pool_seq_unmap_end - 1) * pool_width
     last_overlap = overlap_end - last_start
-    if last_overlap < 0.2 * pool_width:
+    if last_overlap < 0.1 * pool_width:
       pool_seq_unmap_end -= 1
 
     seqs_unmap[chr_start_indexes[seq_key], pool_seq_unmap_start:pool_seq_unmap_end] = True
     assert(seqs_unmap[chr_start_indexes[seq_key], pool_seq_unmap_start:pool_seq_unmap_end].sum() == pool_seq_unmap_end-pool_seq_unmap_start)
+
+  # crop
+  if crop_bp > 0:
+    pool_crop = crop_bp // pool_width
+    seqs_unmap = seqs_unmap[:, pool_crop:-pool_crop]
 
   return seqs_unmap
 
@@ -552,17 +609,14 @@ def break_large_contigs(contigs, break_t, verbose=False):
 
 
 ################################################################################
-def contig_sequences(contigs, seq_length, stride, snap=None, label=None):
+def contig_sequences(contigs, seq_length, stride, snap=1, label=None):
   ''' Break up a list of Contig's into a list of ModelSeq's. '''
   mseqs = []
   for ctg in contigs:
-    if snap is None:
-      seq_start = ctg.start
-    else:
-      seq_start = int(np.ceil(ctg.start/snap)*snap)
+    seq_start = int(np.ceil(ctg.start/snap)*snap)
     seq_end = seq_start + seq_length
 
-    while seq_end < ctg.end:
+    while seq_end <= ctg.end:
       # record sequence
       mseqs.append(ModelSeq(ctg.chr, seq_start, seq_end, label))
 
@@ -571,6 +625,166 @@ def contig_sequences(contigs, seq_length, stride, snap=None, label=None):
       seq_end += stride
       
   return mseqs
+
+
+################################################################################
+def curate_peaks(targets_df, out_dir, pool_width, crop_bp):
+  """Merge all peaks, round to nearest pool_width, and add cropped bp."""
+
+  # concatenate and extend peaks
+  cat_bed_file = '%s/peaks_cat.bed' % out_dir
+  cat_bed_out = open(cat_bed_file, 'w')
+  for bed_file in targets_df.file:
+    if bed_file[-3:] == '.gz':
+      bed_in = gzip.open(bed_file, 'rt')
+    else:
+      bed_in = open(bed_file, 'r')
+
+    for line in bed_in:
+      a = line.rstrip().split('\t')
+      chrm = a[0]
+      start = int(a[1])
+      end = int(a[2])
+      
+      # extend to pool width
+      length = end - start
+      if length < pool_width:
+        mid = (start + end) // 2
+        start = mid - pool_width//2
+        end = start + pool_width
+
+      # add cropped bp
+      start = max(0, start-crop_bp)
+      end += crop_bp
+
+      # print
+      print('%s\t%d\t%d' % (chrm,start,end), file=cat_bed_out)
+
+    bed_in.close()
+  cat_bed_out.close()
+
+  # merge
+  merge_bed_file = '%s/peaks_merge.bed' % out_dir
+  bedtools_cmd = 'bedtools sort -i %s' % cat_bed_file
+  bedtools_cmd += ' | bedtools merge -i - > %s' % merge_bed_file
+  subprocess.call(bedtools_cmd, shell=True)
+
+  # round and add crop_bp
+  full_bed_file = '%s/peaks_full.bed' % out_dir
+  full_bed_out = open(full_bed_file, 'w')
+
+  for line in open(merge_bed_file):
+    a = line.rstrip().split('\t')
+    chrm = a[0]
+    start = int(a[1])
+    end = int(a[2])
+    mid = (start + end) // 2
+    length = end - start
+
+    # round length to nearest pool_width
+    bins = int(np.round(length/pool_width))
+    assert(bins > 0)
+    start = mid - (bins*pool_width)//2
+    start = max(0, start)
+    end = start + (bins*pool_width)
+
+    # add cropped bp
+    # start = max(0, start-crop_bp)
+    # end += crop_bp
+
+    # write
+    print('%s\t%d\t%d' % (chrm,start,end), file=full_bed_out)
+
+  full_bed_out.close()
+
+  return full_bed_file
+
+
+################################################################################
+def divide_contigs_chr(contigs, test_chrs, valid_chrs):
+  """Divide list of contigs into train/valid/test lists
+     by chromosome."""
+
+  # initialize current train/valid/test nucleotides
+  train_nt = 0
+  valid_nt = 0
+  test_nt = 0
+
+  # initialize train/valid/test contig lists
+  train_contigs = []
+  valid_contigs = []
+  test_contigs = []
+
+  # process contigs
+  for ctg in contigs:
+    ctg_len = ctg.end - ctg.start
+
+    if ctg.chr in test_chrs:
+      test_contigs.append(ctg)
+      test_nt += ctg_len
+    elif ctg.chr in valid_chrs:
+      valid_contigs.append(ctg)
+      valid_nt += ctg_len
+    else:
+      train_contigs.append(ctg)
+      train_nt += ctg_len
+
+  total_nt = train_nt + valid_nt + test_nt
+
+  print('Contigs divided into')
+  print(' Train: %5d contigs, %10d nt (%.4f)' % \
+      (len(train_contigs), train_nt, train_nt/total_nt))
+  print(' Valid: %5d contigs, %10d nt (%.4f)' % \
+      (len(valid_contigs), valid_nt, valid_nt/total_nt))
+  print(' Test:  %5d contigs, %10d nt (%.4f)' % \
+      (len(test_contigs), test_nt, test_nt/total_nt))
+
+  return [train_contigs, valid_contigs, test_contigs]
+
+
+################################################################################
+def divide_contigs_folds(contigs, folds):
+  """Divide list of contigs into cross fold lists."""
+
+  # sort contigs descending by length
+  length_contigs = [(ctg.end-ctg.start,ctg) for ctg in contigs]
+  length_contigs.sort(reverse=True)
+
+  # compute total nucleotides
+  total_nt = sum([lc[0] for lc in length_contigs])
+
+  # compute aimed fold nucleotides
+  fold_nt_aim = int(np.ceil(total_nt / folds))
+
+  # initialize current fold nucleotides
+  fold_nt = np.zeros(folds)
+
+  # initialize fold contig lists
+  fold_contigs = []
+  for fi in range(folds):
+    fold_contigs.append([])
+
+  # process contigs
+  for ctg_len, ctg in length_contigs:
+
+    # compute gap between current and aim
+    fold_nt_gap = fold_nt_aim - fold_nt
+    fold_nt_gap = np.clip(fold_nt_gap, 0, np.inf)
+
+    # compute sample probability
+    fold_prob = fold_nt_gap / fold_nt_gap.sum()
+
+    # sample train/valid/test
+    fi = np.random.choice(folds, p=fold_prob)
+    fold_contigs[fi].append(ctg)
+    fold_nt[fi] += ctg_len
+
+  print('Contigs divided into')
+  for fi in range(folds):
+    print(' Fold%d: %5d contigs, %10d nt (%.4f)' % \
+      (fi, len(fold_contigs[fi]), fold_nt[fi], fold_nt[fi]/total_nt))
+
+  return fold_contigs
 
 
 ################################################################################
@@ -643,49 +857,7 @@ def divide_contigs_pct(contigs, test_pct, valid_pct, pct_abstain=0.2):
   print(' Test:  %5d contigs, %10d nt (%.4f)' % \
       (len(test_contigs), test_nt, test_nt/total_nt))
 
-  return train_contigs, valid_contigs, test_contigs
-
-
-################################################################################
-def divide_contigs_chr(contigs, test_chrs, valid_chrs):
-  """Divide list of contigs into train/valid/test lists
-     by chromosome."""
-
-  # initialize current train/valid/test nucleotides
-  train_nt = 0
-  valid_nt = 0
-  test_nt = 0
-
-  # initialize train/valid/test contig lists
-  train_contigs = []
-  valid_contigs = []
-  test_contigs = []
-
-  # process contigs
-  for ctg in contigs:
-    ctg_len = ctg.end - ctg.start
-
-    if ctg.chr in test_chrs:
-      test_contigs.append(ctg)
-      test_nt += ctg_len
-    elif ctg.chr in valid_chrs:
-      valid_contigs.append(ctg)
-      valid_nt += ctg_len
-    else:
-      train_contigs.append(ctg)
-      train_nt += ctg_len
-
-  total_nt = train_nt + valid_nt + test_nt
-
-  print('Contigs divided into')
-  print(' Train: %5d contigs, %10d nt (%.4f)' % \
-      (len(train_contigs), train_nt, train_nt/total_nt))
-  print(' Valid: %5d contigs, %10d nt (%.4f)' % \
-      (len(valid_contigs), valid_nt, valid_nt/total_nt))
-  print(' Test:  %5d contigs, %10d nt (%.4f)' % \
-      (len(test_contigs), test_nt, test_nt/total_nt))
-
-  return train_contigs, valid_contigs, test_contigs
+  return [train_contigs, valid_contigs, test_contigs]
 
 
 ################################################################################
@@ -704,13 +876,13 @@ def limit_contigs(contigs, filter_bed):
   ctg_fd, ctg_bed_file = tempfile.mkstemp()
   ctg_bed_out = open(ctg_bed_file, 'w')
   for ctg in contigs:
-    print('%s\t%d\t%d' % (ctg.chrom, ctg.start, ctg.end), file=ctg_bed_out)
+    print('%s\t%d\t%d' % (ctg.chr, ctg.start, ctg.end), file=ctg_bed_out)
   ctg_bed_out.close()
 
   # intersect w/ filter_bed
   fcontigs = []
   p = subprocess.Popen(
-      'bedtools intersect -u -a %s -b %s' % (ctg_bed_file, filter_bed),
+      'bedtools intersect -a %s -b %s' % (ctg_bed_file, filter_bed),
       shell=True,
       stdout=subprocess.PIPE)
   for line in p.stdout:

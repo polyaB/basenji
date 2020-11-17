@@ -48,15 +48,9 @@ Compute SNP Activity Difference (SAD) scores for SNPs in a VCF file.
 def main():
   usage = 'usage: %prog [options] <params_file> <model_file> <vcf_file>'
   parser = OptionParser(usage)
-  parser.add_option('--cpu', dest='cpu',
-      default=False, action='store_true',
-      help='Run without a GPU [Default: %default]')
   parser.add_option('-f', dest='genome_fasta',
       default='%s/data/hg19.fa' % os.environ['BASENJIDIR'],
       help='Genome FASTA for sequences [Default: %default]')
-  parser.add_option('--local', dest='local',
-      default=1024, type='int',
-      help='Local SAD score [Default: %default]')
   parser.add_option('-n', dest='norm_file',
       default=None,
       help='Normalize SAD scores')
@@ -97,6 +91,24 @@ def main():
     params_file = args[0]
     model_file = args[1]
     vcf_file = args[2]
+
+  elif len(args) == 4:
+    # multi separate
+    options_pkl_file = args[0]
+    params_file = args[1]
+    model_file = args[2]
+    vcf_file = args[3]
+
+    # save out dir
+    out_dir = options.out_dir
+
+    # load options
+    options_pkl = open(options_pkl_file, 'rb')
+    options = pickle.load(options_pkl)
+    options_pkl.close()
+
+    # update output directory
+    options.out_dir = out_dir
 
   elif len(args) == 5:
     # multi worker
@@ -159,6 +171,7 @@ def main():
   seqnn_model.build_slice(target_slice)
   seqnn_model.build_ensemble(options.rc, options.shifts)
 
+  targets_length = seqnn_model.target_lengths[0]
   num_targets = seqnn_model.num_targets()
   if options.targets_file is None:
     target_ids = ['t%d' % ti for ti in range(num_targets)]
@@ -174,7 +187,8 @@ def main():
     worker_bounds = np.linspace(0, num_snps, options.processes+1, dtype='int')
 
     # read SNPs form VCF
-    snps = bvcf.vcf_snps(vcf_file, start_i=worker_bounds[worker_index], end_i=worker_bounds[worker_index+1])
+    snps = bvcf.vcf_snps(vcf_file, start_i=worker_bounds[worker_index],
+      end_i=worker_bounds[worker_index+1])
 
   else:
     # read SNPs form VCF
@@ -197,7 +211,7 @@ def main():
   # setup output
 
   sad_out = initialize_output_h5(options.out_dir, options.sad_stats,
-                                 snps, target_ids, target_labels)
+                                 snps, target_ids, target_labels, targets_length)
 
   if options.threads:
     snp_threads = []
@@ -212,7 +226,7 @@ def main():
   # predict SNP scores, write output
 
   # initialize predictions stream
-  preds_stream = stream.PredStreamGen(seqnn_model, snp_gen(), params['train']['batch_size'])
+  preds_stream = stream.PredStreamGen(seqnn_model, snp_gen(), params_train['batch_size'])
 
   # predictions index
   pi = 0
@@ -247,7 +261,7 @@ def main():
   sad_out.close()
 
 
-def initialize_output_h5(out_dir, sad_stats, snps, target_ids, target_labels):
+def initialize_output_h5(out_dir, sad_stats, snps, target_ids, target_labels, targets_length):
   """Initialize an output HDF5 file for SAD stats."""
 
   num_targets = len(target_ids)
@@ -282,8 +296,8 @@ def initialize_output_h5(out_dir, sad_stats, snps, target_ids, target_labels):
       snp_alts.append(snp.alt_alleles[0])
   snp_refs = np.array(snp_refs, 'S')
   snp_alts = np.array(snp_alts, 'S')
-  sad_out.create_dataset('ref', data=snp_refs)
-  sad_out.create_dataset('alt', data=snp_alts)
+  sad_out.create_dataset('ref_allele', data=snp_refs)
+  sad_out.create_dataset('alt_allele', data=snp_alts)
 
   # write targets
   sad_out.create_dataset('target_ids', data=np.array(target_ids, 'S'))
@@ -291,10 +305,14 @@ def initialize_output_h5(out_dir, sad_stats, snps, target_ids, target_labels):
 
   # initialize SAD stats
   for sad_stat in sad_stats:
-    sad_out.create_dataset(sad_stat,
+    if sad_stat in ['REF','ALT']:
+      sad_out.create_dataset(sad_stat,
+        shape=(num_snps, targets_length, num_targets),
+        dtype='float16')
+    else:      
+      sad_out.create_dataset(sad_stat,
         shape=(num_snps, num_targets),
-        dtype='float16',
-        compression=None)
+        dtype='float16')
 
   return sad_out
 
@@ -314,40 +332,66 @@ def write_pct(sad_out, sad_stats):
   pct_len = len(percentiles)
 
   for sad_stat in sad_stats:
-    sad_stat_pct = '%s_pct' % sad_stat
+    if sad_stat not in ['REF','ALT']:
+      sad_stat_pct = '%s_pct' % sad_stat
 
-    # compute
-    sad_pct = np.percentile(sad_out[sad_stat], 100*percentiles, axis=0).T
-    sad_pct = sad_pct.astype('float16')
+      # compute
+      sad_pct = np.percentile(sad_out[sad_stat], 100*percentiles, axis=0).T
+      sad_pct = sad_pct.astype('float16')
 
-    # save
-    sad_out.create_dataset(sad_stat_pct, data=sad_pct, dtype='float16')
+      # save
+      sad_out.create_dataset(sad_stat_pct, data=sad_pct, dtype='float16')
 
     
 def write_snp(ref_preds, alt_preds, sad_out, si, sad_stats, log_pseudo):
   """Write SNP predictions to HDF."""
 
+  ref_preds = ref_preds.astype('float64')
+  alt_preds = alt_preds.astype('float64')
+  num_targets = ref_preds.shape[-1]
+
   # sum across length
-  ref_preds_sum = ref_preds.sum(axis=0, dtype='float64')
-  alt_preds_sum = alt_preds.sum(axis=0, dtype='float64')
+  ref_preds_sum = ref_preds.sum(axis=0)
+  alt_preds_sum = alt_preds.sum(axis=0)
 
   # compare reference to alternative via mean subtraction
   if 'SAD' in sad_stats:
     sad = alt_preds_sum - ref_preds_sum
     sad_out['SAD'][si,:] = sad.astype('float16')
 
+  # compare reference to alternative via max subtraction
+  if 'SAX' in sad_stats:
+    sad_vec = (alt_preds - ref_preds)
+    max_i = np.argmax(np.abs(sad_vec), axis=0)
+    sax = sad_vec[max_i, np.arange(num_targets)]
+    sad_out['SAX'][si,:] = sax.astype('float16')
+
   # compare reference to alternative via mean log division
-  if 'SAR' in sad_stats:
+  if 'SADR' in sad_stats:
     sar = np.log2(alt_preds_sum + log_pseudo) \
                    - np.log2(ref_preds_sum + log_pseudo)
-    sad_out['SAR'][szi,:] = sar.astype('float16')
+    sad_out['SADR'][si,:] = sar.astype('float16')
+
+  # compare reference to alternative via max subtraction
+  if 'SAXR' in sad_stats:
+    sar_vec = np.log2(alt_preds + log_pseudo) \
+                - np.log2(ref_preds + log_pseudo)
+    max_i = np.argmax(np.abs(sar_vec), axis=0)
+    saxr = sar_vec[max_i, np.arange(num_targets)]
+    sad_out['SAXR'][si,:] = saxr.astype('float16')
 
   # compare geometric means
-  if 'geoSAD' in sad_stats:
-    sar_vec = np.log2(alt_preds.astype('float64') + log_pseudo) \
-                - np.log2(ref_preds.astype('float64') + log_pseudo)
+  if 'SAR' in sad_stats:
+    sar_vec = np.log2(alt_preds + log_pseudo) \
+                - np.log2(ref_preds + log_pseudo)
     geo_sad = sar_vec.sum(axis=0)
-    sad_out['geoSAD'][szi,:] = geo_sad.astype('float16')
+    sad_out['SAR'][si,:] = geo_sad.astype('float16')
+
+  # predictions
+  if 'REF' in sad_stats:
+    sad_out['REF'][si,:] = ref_preds.astype('float16')
+  if 'ALT' in sad_stats:
+    sad_out['ALT'][si,:] = alt_preds.astype('float16')
 
 
 class SNPWorker(Thread):

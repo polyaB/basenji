@@ -48,6 +48,9 @@ Test the accuracy of a trained model on targets/predictions normalized across ta
 def main():
   usage = 'usage: %prog [options] <params_file> <model_file> <data_dir>'
   parser = OptionParser(usage)
+  parser.add_option('--head', dest='head_i',
+      default=0, type='int',
+      help='Parameters head to test [Default: %default]')
   parser.add_option('-o', dest='out_dir',
       default='test_out',
       help='Output directory for test statistics [Default: %default]')
@@ -63,12 +66,15 @@ def main():
   parser.add_option('-t', dest='targets_file',
       default=None, type='str',
       help='File specifying target indexes and labels in table format')
+  parser.add_option('--split', dest='split_label',
+      default='test',
+      help='Dataset split label for eg TFR pattern [Default: %default]')
   parser.add_option('--tfr', dest='tfr_pattern',
-      default='test-*.tfr',
-      help='TFR pattern string appended to data_dir [Default: %default]')
+      default=None,
+      help='TFR pattern string appended to data_dir/tfrecords for subsetting [Default: %default]')
   parser.add_option('-v', dest='high_var_pct',
-  		default=1.0, type='float',
-  		help='Highly variable site proportion to take [Default: %default]')
+      default=1.0, type='float',
+      help='Highly variable site proportion to take [Default: %default]')
   (options, args) = parser.parse_args()
 
   if len(args) != 3:
@@ -85,37 +91,52 @@ def main():
   options.shifts = [int(shift) for shift in options.shifts.split(',')]
 
   #######################################################
-  # inputs
+  # targets
 
-  # read targets
+  # read table
   if options.targets_file is None:
     options.targets_file = '%s/targets.txt' % data_dir
   targets_df = pd.read_csv(options.targets_file, index_col=0, sep='\t')
   num_targets = targets_df.shape[0]
 
-  # read model parameters
+  # classify
+  target_classes = []
+  for ti in range(num_targets):
+    description = targets_df.iloc[ti].description
+    if description.find(':') == -1:
+      tc = '*'
+    else:
+      desc_split = description.split(':')
+      if desc_split[0] == 'CHIP':
+        tc = '/'.join(desc_split[:2])
+      else:
+        tc = desc_split[0]
+    target_classes.append(tc)
+  targets_df['class'] = target_classes
+  target_classes = sorted(set(target_classes))
+  print(target_classes)
+
+  #######################################################
+  # model
+
+  # read parameters
   with open(params_file) as params_open:
     params = json.load(params_open)
   params_model = params['model']
   params_train = params['train']
 
-  # read data parameters
-  data_stats_file = '%s/statistics.json' % data_dir
-  with open(data_stats_file) as data_stats_open:
-    data_stats = json.load(data_stats_open)
-
-  # construct data ops
-  tfr_pattern_path = '%s/tfrecords/%s' % (data_dir, options.tfr_pattern)
-  eval_data = dataset.SeqDataset(tfr_pattern_path,
-    params_train['batch_size'],
-    data_stats['seq_length'],
-    data_stats['target_length'],
-    tf.estimator.ModeKeys.EVAL)
+  # construct eval data
+  eval_data = dataset.SeqDataset(data_dir,
+    split_label=options.split_label,
+    batch_size=params_train['batch_size'],
+    mode=tf.estimator.ModeKeys.EVAL,
+    tfr_pattern=options.tfr_pattern)
 
   # initialize model
   seqnn_model = seqnn.SeqNN(params_model)
-  seqnn_model.restore(model_file)
+  seqnn_model.restore(model_file, options.head_i)
   seqnn_model.build_ensemble(options.rc, options.shifts)
+  seqnn_model.downcast()
 
   #######################################################
   # targets/predictions
@@ -123,7 +144,7 @@ def main():
   # option to read from disk?
 
   # predict
-  eval_preds = seqnn_model.predict(eval_data, verbose=1).astype('float16')
+  eval_preds = seqnn_model.predict(eval_data, verbose=1)
   print('')
   
   # targets
@@ -133,63 +154,49 @@ def main():
   eval_preds = np.reshape(eval_preds, (-1,num_targets))
   eval_targets = np.reshape(eval_targets, (-1,num_targets))
 
-	#######################################################
-  # classify targets
-
-  target_classes = []
-  for ti in range(num_targets):
-  	desc_split = targets_df.iloc[ti].description.split(':')
-  	if desc_split[0] == 'CHIP':
-  		tc = '/'.join(desc_split[:2])
-  	else:
-  		tc = desc_split[0]
-  	target_classes.append(tc)
-  targets_df['class'] = target_classes
-  target_classes = sorted(set(target_classes))
-
   #######################################################
   # process classes
 
   targets_spec = np.zeros(num_targets)
 
   for tc in target_classes:
-  	class_mask = np.array(targets_df['class'] == tc)
-  	num_targets_class = class_mask.sum()
+    class_mask = np.array(targets_df['class'] == tc)
+    num_targets_class = class_mask.sum()
 
-  	if num_targets_class == 1:
-  		targets_spec[class_mask] = np.nan
-  	else:
-	  	# slice class
-	  	eval_preds_class = eval_preds[:,class_mask].astype('float32')
-	  	eval_targets_class = eval_targets[:,class_mask].astype('float32')
+    if num_targets_class == 1:
+      targets_spec[class_mask] = np.nan
+    else:
+      # slice class
+      eval_preds_class = eval_preds[:,class_mask].astype('float32')
+      eval_targets_class = eval_targets[:,class_mask].astype('float32')
 
-	  	# highly variable filter
-	  	if options.high_var_pct < 1:
-	  		eval_targets_var = eval_targets_class.var(axis=1)
-	  		high_var_t = np.percentile(eval_targets_var, 100*(1-options.high_var_pct))
-	  		high_var_mask = (eval_targets_var >= high_var_t)
+      # highly variable filter
+      if options.high_var_pct < 1:
+        eval_targets_var = eval_targets_class.var(axis=1)
+        high_var_t = np.percentile(eval_targets_var, 100*(1-options.high_var_pct))
+        high_var_mask = (eval_targets_var >= high_var_t)
 
-	  		eval_preds_class = eval_preds_class[high_var_mask]
-	  		eval_targets_class = eval_targets_class[high_var_mask]
+        eval_preds_class = eval_preds_class[high_var_mask]
+        eval_targets_class = eval_targets_class[high_var_mask]
 
-	  	# quantile normalize
-	  	eval_preds_norm = quantile_normalize(eval_preds_class)
-	  	eval_targets_norm = quantile_normalize(eval_targets_class)
+      # quantile normalize
+      eval_preds_norm = quantile_normalize(eval_preds_class)
+      eval_targets_norm = quantile_normalize(eval_targets_class)
 
-	  	# mean normalize
-	  	eval_preds_norm = eval_preds_norm - eval_preds_norm.mean(axis=-1, keepdims=True)
-	  	eval_targets_norm = eval_targets_norm - eval_targets_norm.mean(axis=-1, keepdims=True)
+      # mean normalize
+      eval_preds_norm = eval_preds_norm - eval_preds_norm.mean(axis=-1, keepdims=True)
+      eval_targets_norm = eval_targets_norm - eval_targets_norm.mean(axis=-1, keepdims=True)
 
-	  	# compute correlations
-	  	pearsonr_class = np.zeros(num_targets_class)
-	  	for ti in range(num_targets_class):
-	  		pearsonr_class[ti] = pearsonr(eval_preds_norm[:,ti], eval_targets_norm[:,ti])[0]
+      # compute correlations
+      pearsonr_class = np.zeros(num_targets_class)
+      for ti in range(num_targets_class):
+        pearsonr_class[ti] = pearsonr(eval_preds_norm[:,ti], eval_targets_norm[:,ti])[0]
 
-	  	# save
-	  	targets_spec[class_mask] = pearsonr_class
+      # save
+      targets_spec[class_mask] = pearsonr_class
 
-	  	# print
-	  	print('%-15s  %4d  %.4f' % (tc, num_targets_class, pearsonr_class[ti]))
+      # print
+      print('%-15s  %4d  %.4f' % (tc, num_targets_class, pearsonr_class[ti]))
 
   # write target-level statistics
   targets_acc_df = pd.DataFrame({

@@ -24,10 +24,10 @@ import layers
 ############################################################
 # Convolution
 ############################################################
-def conv_block(inputs, filters=None, kernel_size=1, activation='relu', strides=1,
-    dilation_rate=1, l2_scale=0, dropout=0, conv_type='standard', residual=False,
-    pool_size=1, batch_norm=False, bn_momentum=0.99, bn_gamma=None,
-    kernel_initializer='he_normal'):
+def conv_block(inputs, filters=None, kernel_size=1, activation='relu', activation_end=None,
+    strides=1, dilation_rate=1, l2_scale=0, dropout=0, conv_type='standard', residual=False,
+    pool_size=1, batch_norm=False, bn_momentum=0.99, bn_gamma=None, bn_type='standard',
+    kernel_initializer='he_normal', padding='same'):
   """Construct a single convolution block.
 
   Args:
@@ -70,7 +70,7 @@ def conv_block(inputs, filters=None, kernel_size=1, activation='relu', strides=1
     filters=filters,
     kernel_size=kernel_size,
     strides=strides,
-    padding='same',
+    padding=padding,
     use_bias=False,
     dilation_rate=dilation_rate,
     kernel_initializer=kernel_initializer,
@@ -80,10 +80,13 @@ def conv_block(inputs, filters=None, kernel_size=1, activation='relu', strides=1
   if batch_norm:
     if bn_gamma is None:
       bn_gamma = 'zeros' if residual else 'ones'
-    current = tf.keras.layers.BatchNormalization(
+    if bn_type == 'sync':
+      bn_layer = tf.keras.layers.experimental.SyncBatchNormalization
+    else:
+      bn_layer = tf.keras.layers.BatchNormalization
+    current = bn_layer(
       momentum=bn_momentum,
-      gamma_initializer=bn_gamma,
-      fused=None)(current)
+      gamma_initializer=bn_gamma)(current)
 
   # dropout
   if dropout > 0:
@@ -92,6 +95,10 @@ def conv_block(inputs, filters=None, kernel_size=1, activation='relu', strides=1
   # residual add
   if residual:
     current = tf.keras.layers.Add()([inputs,current])
+
+  # end activation
+  if activation_end is not None:
+    current = layers.activate(current, activation_end)
     
   # Pool
   if pool_size > 1:
@@ -104,7 +111,7 @@ def conv_block(inputs, filters=None, kernel_size=1, activation='relu', strides=1
 
 def conv_block_2d(inputs, filters=128, activation='relu', conv_type='standard', 
     kernel_size=1, strides=1, dilation_rate=1, l2_scale=0, dropout=0, pool_size=1,
-    batch_norm=False, bn_momentum=0.99, bn_gamma='ones', symmetric=False):
+    batch_norm=False, bn_momentum=0.99, bn_gamma='ones', bn_type='standard', symmetric=False):
   """Construct a single 2D convolution block.   """
 
   # flow through variable current
@@ -132,10 +139,13 @@ def conv_block_2d(inputs, filters=128, activation='relu', conv_type='standard',
 
   # batch norm
   if batch_norm:
-    current = tf.keras.layers.BatchNormalization(
+    if bn_type == 'sync':
+      bn_layer = tf.keras.layers.experimental.SyncBatchNormalization
+    else:
+      bn_layer = tf.keras.layers.BatchNormalization
+    current = bn_layer(
       momentum=bn_momentum,
-      gamma_initializer=bn_gamma,
-      fused=True)(current)
+      gamma_initializer=bn_gamma)(current)
 
   # dropout
   if dropout > 0:
@@ -335,7 +345,7 @@ def xception_tower(inputs, filters_init, filters_mult=1, repeat=1, **kwargs):
 # Attention
 ############################################################
 def attention(inputs, kq_depth=None, max_relative_position=64,
-    batch_norm=False, bn_momentum=0.99, **kwargs):
+    batch_norm=False, bn_momentum=0.99, bn_type='standard', **kwargs):
   """Construct a residual attention block.
 
   Args:
@@ -383,10 +393,13 @@ def attention(inputs, kq_depth=None, max_relative_position=64,
 
   # batch norm
   if batch_norm:
-    z = tf.keras.layers.BatchNormalization(
+    if bn_type == 'sync':
+      bn_layer = tf.keras.layers.experimental.SyncBatchNormalization
+    else:
+      bn_layer = tf.keras.layers.BatchNormalization
+    z = bn_layer(
       momentum=bn_momentum,
-      gamma_initializer='zeros',
-      fused=True)(z)
+      gamma_initializer='zeros')(z)
 
   # residual add
   current = tf.keras.layers.Add()([current,z])
@@ -557,6 +570,14 @@ def dilated_residual_2d(inputs, filters, kernel_size=3, rate_mult=2,
   return current
 
 ############################################################
+# Activations
+############################################################
+
+def exp(inputs, base=None, minus=None, **kwargs):
+  current = layers.Exp(base, minus)(inputs)
+  return current
+
+############################################################
 # Center ops
 ############################################################
 
@@ -595,19 +616,43 @@ def upper_tri(inputs, diagonal_offset=2, **kwargs):
   current = layers.UpperTri(diagonal_offset)(inputs)
   return current
 
+############################################################
+# Factorization
+############################################################
+
+def factor_inverse(inputs, components_file, **kwargs):
+  current = layers.FactorInverse(components_file)(inputs)
+  return current
 
 ############################################################
 # Keras defaults
 ############################################################
-def dense(inputs, units, activation='softplus', kernel_initializer='he_normal',
-    l2_scale=0, l1_scale=0, **kwargs):
+def final(inputs, units, activation='linear', kernel_initializer='he_normal',
+          l2_scale=0, l1_scale=0, **kwargs):
+
   current = tf.keras.layers.Dense(
     units=units,
-    activation=activation,
     use_bias=True,
+    activation=activation,
     kernel_initializer=kernel_initializer,
     kernel_regularizer=tf.keras.regularizers.l1_l2(l1_scale, l2_scale)
     )(inputs)
+
+  return current
+
+# depracated, poorly named
+def dense(inputs, units, activation='linear', kernel_initializer='he_normal',
+          l2_scale=0, l1_scale=0, **kwargs):
+
+  # apply dense layer
+  current = tf.keras.layers.Dense(
+    units=units,
+    use_bias=True,
+    activation=activation,
+    kernel_initializer=kernel_initializer,
+    kernel_regularizer=tf.keras.regularizers.l1_l2(l1_scale, l2_scale)
+    )(inputs)
+
   return current
 
 
@@ -675,6 +720,8 @@ name_func = {
   'dilated_residual': dilated_residual,
   'dilated_residual_2d': dilated_residual_2d,
   'dilated_dense': dilated_dense,
+  'exp': exp,
+  'factor_inverse': factor_inverse,
   'global_context': global_context,
   'one_to_two': one_to_two,
   'symmetrize_2d':symmetrize_2d,
@@ -690,5 +737,6 @@ keras_func = {
   'Conv1D': tf.keras.layers.Conv1D,
   'Cropping1D': tf.keras.layers.Cropping1D,
   'Cropping2D': tf.keras.layers.Cropping2D,
-  'Dense': tf.keras.layers.Dense
+  'Dense': tf.keras.layers.Dense,
+  'Flatten': tf.keras.layers.Flatten
 }

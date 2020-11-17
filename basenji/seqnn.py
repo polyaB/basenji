@@ -42,7 +42,7 @@ class SeqNN():
     # only necessary for my bespoke parameters
     # others are best defaulted closer to the source
     self.augment_rc = False
-    self.augment_shift = 0
+    self.augment_shift = [0]
 
   def build_block(self, current, block_params):
     """Construct a SeqNN block.
@@ -56,6 +56,9 @@ class SeqNN():
     block_name = block_params['name']
     del block_params['name']
 
+    # save upper_tri flaten
+    self.preds_triu |= (block_name == 'upper_tri')
+        
     # if Keras, get block variables names
     pass_all_globals = True
     if block_name[0].isupper():
@@ -64,8 +67,8 @@ class SeqNN():
       block_varnames = block_func.__init__.__code__.co_varnames
 
     # set global defaults
-    global_vars = ['activation', 'batch_norm', 'bn_momentum',
-      'l2_scale', 'l1_scale']
+    global_vars = ['activation', 'batch_norm', 'bn_momentum', 'bn_type',
+      'l2_scale', 'l1_scale','padding']
     for gv in global_vars:
       gv_value = getattr(self, gv, False)
       if gv_value and (pass_all_globals or gv in block_varnames):
@@ -90,14 +93,15 @@ class SeqNN():
     # inputs
     ###################################################
     sequence = tf.keras.Input(shape=(self.seq_length, 4), name='sequence')
-    # self.genome = tf.keras.Input(shape=(1,), name='genome')
     current = sequence
 
     # augmentation
     if self.augment_rc:
       current, reverse_bool = layers.StochasticReverseComplement()(current)
-    current = layers.StochasticShift(self.augment_shift)(current)
-
+    if self.augment_shift != [0]:
+      current = layers.StochasticShift(self.augment_shift)(current)
+    self.preds_triu = False
+    
     ###################################################
     # build convolution blocks
     ###################################################
@@ -114,8 +118,6 @@ class SeqNN():
     ###################################################
     # heads
     ###################################################
-    self.preds_triu = False
-
     head_keys = natsorted([v for v in vars(self) if v.startswith('head')])
     self.heads = [getattr(self, hk) for hk in head_keys]
 
@@ -129,7 +131,6 @@ class SeqNN():
 
       # build blocks
       for bi, block_params in enumerate(head):
-        self.preds_triu |= (block_params['name'] == 'upper_tri')
         current = self.build_block(current, block_params)
 
       # transform back from reverse complement
@@ -145,10 +146,9 @@ class SeqNN():
     ###################################################
     # compile model(s)
     ###################################################
-    # self.model = tf.keras.Model(inputs=sequence, outputs=self.preds)
     self.models = []
     for ho in self.head_output:
-        self.models.append(tf.keras.Model(inputs=sequence, outputs=ho))
+      self.models.append(tf.keras.Model(inputs=sequence, outputs=ho))
     self.model = self.models[0]
     with open("/mnt/storage/home/psbelokopytova/nn_anopheles/model_test", "w") as f:
       self.model.summary(print_fn=lambda x: f.write(x + '\n'))
@@ -165,19 +165,30 @@ class SeqNN():
       for layer in self.model.layers:
         if hasattr(layer, 'strides'):
           self.model_strides[-1] *= layer.strides[0]
-      target_full_length = sequence.shape[1] // self.model_strides[-1]
+      if type(sequence.shape[1]) == tf.compat.v1.Dimension:
+        target_full_length = sequence.shape[1].value // self.model_strides[-1]
+      else:
+        target_full_length = sequence.shape[1] // self.model_strides[-1]
+
       self.target_lengths.append(model.outputs[0].shape[1])
+      if type(self.target_lengths[-1]) == tf.compat.v1.Dimension:
+        self.target_lengths[-1] = self.target_lengths[-1].value
       self.target_crops.append((target_full_length - self.target_lengths[-1])//2)
     print('model_strides', self.model_strides)
     print('target_lengths', self.target_lengths)
     print('target_crops', self.target_crops)
 
-  def build_embed(self, conv_layer_i):
+
+  def build_embed(self, conv_layer_i, batch_norm=True):
     if conv_layer_i == -1:
       self.embed = tf.keras.Model(inputs=self.model.inputs,
                                   outputs=self.model.inputs)
     else:
-      conv_layer = self.get_bn_layer(conv_layer_i)
+      if batch_norm:
+        conv_layer = self.get_bn_layer(conv_layer_i)
+      else:
+        conv_layer = self.get_conv_layer(conv_layer_i)
+
       self.embed = tf.keras.Model(inputs=self.model.inputs,
                                   outputs=conv_layer.output)
 
@@ -207,7 +218,7 @@ class SeqNN():
         preds = [layers.SwitchReverse()([self.model(seq), rp]) for (seq,rp) in sequences_rev]
 
       # create layer
-      preds_avg = tf.keras.layers.Average()(preds)      
+      preds_avg = tf.keras.layers.Average()(preds)
 
       # create meta model
       self.ensemble = tf.keras.Model(inputs=sequence, outputs=preds_avg)
@@ -229,38 +240,78 @@ class SeqNN():
         self.model = tf.keras.Model(inputs=sequence, outputs=predictions_slice)
 
 
-  def evaluate(self, seq_data, head_i=0, loss='poisson'):
-    """ Evaluate model on SeqDataset. """
+  def downcast(self, dtype=tf.float16, head_i=None):
+    """ Downcast model output type. """
     # choose model
-    if self.ensemble is None:
+    if self.embed is not None:
+      model = self.embed
+    elif self.ensemble is not None:
+      model = self.ensemble
+    elif head_i is not None:
       model = self.models[head_i]
     else:
+      model = self.model
+
+    # sequence input
+    sequence = tf.keras.Input(shape=(self.seq_length, 4), name='sequence')
+
+    # predict and downcast
+    preds = model(sequence)
+    preds = tf.cast(preds, dtype)
+    model_down = tf.keras.Model(inputs=sequence, outputs=preds)
+
+    # replace model
+    if self.embed is not None:  
+      self.embed = model_down
+    elif self.ensemble is not None:
+      self.ensemble = model_down
+    elif head_i is not None:
+      self.models[head_i] = model_down
+    else:
+      self.model = model_down
+
+
+  def evaluate(self, seq_data, head_i=None, loss='poisson'):
+    """ Evaluate model on SeqDataset. """
+    # choose model
+    if self.ensemble is not None:
       model = self.ensemble
+    elif head_i is not None:
+      model = self.models[head_i]
+    else:
+      model = self.model
 
     # compile with dense metrics
-    num_targets = self.model.output_shape[-1]
-    model.compile(optimizer=tf.keras.optimizers.SGD(),
-                  loss=loss,
-                  metrics=[metrics.PearsonR(num_targets, summarize=False),
-                           metrics.R2(num_targets, summarize=False)])
+    num_targets = model.output_shape[-1]
+
+    if loss == 'bce':
+      model.compile(optimizer=tf.keras.optimizers.SGD(),
+                    loss=loss,
+                    metrics=[metrics.SeqAUC(curve='ROC', summarize=False),
+                             metrics.SeqAUC(curve='PR', summarize=False)])
+    else:      
+      model.compile(optimizer=tf.keras.optimizers.SGD(),
+                    loss=loss,
+                    metrics=[metrics.PearsonR(num_targets, summarize=False),
+                             metrics.R2(num_targets, summarize=False)])
 
     # evaluate
     return model.evaluate(seq_data.dataset)
 
 
-  def get_bn_layer(self, bn_layer_i):
+  def get_bn_layer(self, bn_layer_i=0):
     """ Return specified batch normalization layer. """
     bn_layers = [layer for layer in self.model.layers if layer.name.startswith('batch_normalization')]
     return bn_layers[bn_layer_i]
 
 
-  def get_conv_layer(self, conv_layer_i):
+  def get_conv_layer(self, conv_layer_i=0):
     """ Return specified convolution layer. """
     conv_layers = [layer for layer in self.model.layers if layer.name.startswith('conv')]
     return conv_layers[conv_layer_i]
 
 
-  def get_conv_weights(self, conv_layer_i):
+  def get_conv_weights(self, conv_layer_i=0):
     """ Return kernel weights for specified convolution layer. """
     conv_layer = self.get_conv_layer(conv_layer_i)
     weights = conv_layer.weights[0].numpy()
@@ -275,15 +326,15 @@ class SeqNN():
       return self.models[head_i].output_shape[-1]
 
 
-  def predict(self, seq_data, head_i=0, generator=False, **kwargs):
+  def predict(self, seq_data, head_i=None, generator=False, **kwargs):
     """ Predict targets for SeqDataset. """
     # choose model
-    if self.embed is not None:
-      model = self.embed
-    elif self.ensemble is not None:
+    if self.ensemble is not None:
       model = self.ensemble
-    else:
+    elif head_i is not None:
       model = self.models[head_i]
+    else:
+      model = self.model
 
     dataset = getattr(seq_data, 'dataset', None)
     if dataset is None:
@@ -295,12 +346,13 @@ class SeqNN():
       return model.predict(dataset, **kwargs)
 
 
-  def restore(self, model_file, trunk=False):
+  def restore(self, model_file, head_i=0, trunk=False):
     """ Restore weights from saved model. """
     if trunk:
       self.model_trunk.load_weights(model_file)
     else:
-      self.model.load_weights(model_file)
+      self.models[head_i].load_weights(model_file)
+      self.model = self.models[head_i]
 
 
   def save(self, model_file, trunk=False):

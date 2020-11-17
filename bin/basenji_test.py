@@ -39,6 +39,7 @@ import seaborn as sns
 from basenji import dataset
 from basenji import plots
 from basenji import seqnn
+from basenji import trainer
 
 if tf.__version__[0] == '1':
   tf.compat.v1.enable_eager_execution()
@@ -57,6 +58,9 @@ def main():
   parser = OptionParser(usage)
   parser.add_option('--ai', dest='accuracy_indexes',
       help='Comma-separated list of target indexes to make accuracy scatter plots.')
+  parser.add_option('--head', dest='head_i',
+      default=0, type='int',
+      help='Parameters head to test [Default: %default]')
   parser.add_option('--mc', dest='mc_n',
       default=0, type='int',
       help='Monte carlo test iterations [Default: %default]')
@@ -78,9 +82,12 @@ def main():
   parser.add_option('-t', dest='targets_file',
       default=None, type='str',
       help='File specifying target indexes and labels in table format')
+  parser.add_option('--split', dest='split_label',
+      default='test',
+      help='Dataset split label for eg TFR pattern [Default: %default]')
   parser.add_option('--tfr', dest='tfr_pattern',
-      default='test-*.tfr',
-      help='TFR pattern string appended to data_dir [Default: %default]')
+      default=None,
+      help='TFR pattern string appended to data_dir/tfrecords for subsetting [Default: %default]')
   (options, args) = parser.parse_args()
 
   if len(args) != 3:
@@ -109,47 +116,58 @@ def main():
     params = json.load(params_open)
   params_model = params['model']
   params_train = params['train']
-
-  # read data parameters
-  data_stats_file = '%s/statistics.json' % data_dir
-  with open(data_stats_file) as data_stats_open:
-    data_stats = json.load(data_stats_open)
-
-  # construct data ops
-  tfr_pattern_path = '%s/tfrecords/%s' % (data_dir, options.tfr_pattern)
-  eval_data = dataset.SeqDataset(tfr_pattern_path,
-    params_train['batch_size'],
-    data_stats['seq_length'],
-    data_stats['target_length'],
-    tf.estimator.ModeKeys.EVAL)
+  
+  # construct eval data
+  eval_data = dataset.SeqDataset(data_dir,
+    split_label=options.split_label,
+    batch_size=params_train['batch_size'],
+    mode=tf.estimator.ModeKeys.EVAL,
+    tfr_pattern=options.tfr_pattern)
 
   # initialize model
   seqnn_model = seqnn.SeqNN(params_model)
-  seqnn_model.restore(model_file)
+  seqnn_model.restore(model_file, options.head_i)
   seqnn_model.build_ensemble(options.rc, options.shifts)
 
   #######################################################
   # evaluate
 
-  eval_loss = params_train.get('loss', 'poisson')
+  loss_label = params_train.get('loss', 'poisson').lower()
+  spec_weight = params_train.get('spec_weight', 1)
+  loss_fn = trainer.parse_loss(loss_label, spec_weight=spec_weight)
 
   # evaluate
-  test_loss, test_pr, test_r2 = seqnn_model.evaluate(eval_data, loss=eval_loss)
-  print('')
+  test_loss, test_metric1, test_metric2 = seqnn_model.evaluate(eval_data, loss=loss_fn)
 
   # print summary statistics
-  print('Test Loss:         %7.5f' % test_loss)
-  print('Test R2:           %7.5f' % test_r2.mean())
-  print('Test PearsonR:     %7.5f' % test_pr.mean())
+  print('\nTest Loss:         %7.5f' % test_loss)
 
-  # write target-level statistics
-  targets_acc_df = pd.DataFrame({
+  if loss_label == 'bce':
+    print('Test AUROC:        %7.5f' % test_metric1.mean())
+    print('Test AUPRC:        %7.5f' % test_metric2.mean())
+
+    # write target-level statistics
+    targets_acc_df = pd.DataFrame({
       'index': targets_df.index,
-      'r2': test_r2,
-      'pearsonr': test_pr,
+      'auroc': test_metric1,
+      'auprc': test_metric2,
       'identifier': targets_df.identifier,
       'description': targets_df.description
       })
+
+  else:
+    print('Test PearsonR:     %7.5f' % test_metric1.mean())
+    print('Test R2:           %7.5f' % test_metric2.mean())
+
+    # write target-level statistics
+    targets_acc_df = pd.DataFrame({
+      'index': targets_df.index,
+      'pearsonr': test_metric1,
+      'r2': test_metric2,
+      'identifier': targets_df.identifier,
+      'description': targets_df.description
+      })
+
   targets_acc_df.to_csv('%s/acc.txt'%options.out_dir, sep='\t',
                         index=False, float_format='%.5f')
 
@@ -158,7 +176,7 @@ def main():
 
   if options.save or options.peaks or options.accuracy_indexes is not None:
     # compute predictions
-    test_preds = seqnn_model.predict(eval_data)
+    test_preds = seqnn_model.predict(eval_data).astype('float16')
 
     # read targets
     test_targets = eval_data.numpy(return_inputs=False)

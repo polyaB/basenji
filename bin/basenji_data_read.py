@@ -21,7 +21,11 @@ import sys
 import h5py
 import intervaltree
 import numpy as np
-import pyBigWig
+import pandas as pd
+try:
+  import pyBigWig
+except:
+  pass
 import scipy.interpolate
 
 from basenji_data import ModelSeq
@@ -43,6 +47,9 @@ def main():
   parser.add_option('-c', dest='clip',
       default=None, type='float',
       help='Clip values post-summary to a maximum [Default: %default]')
+  parser.add_option('--clip_soft', dest='clip_soft',
+      default=None, type='float',
+      help='Soft clip values, applying sqrt to the execess above the threshold [Default: %default]')
   parser.add_option('--crop', dest='crop_bp',
       default=0, type='int',
       help='Crop bp off each end [Default: %default]')
@@ -52,9 +59,6 @@ def main():
   parser.add_option('-s', dest='scale',
       default=1., type='float',
       help='Scale values by [Default: %default]')
-  parser.add_option('--soft', dest='soft_clip',
-      default=False, action='store_true',
-      help='Soft clip values, applying sqrt to the execess above the threshold [Default: %default]')
   parser.add_option('-u', dest='sum_stat',
       default='sum',
       help='Summary statistic to compute in windows [Default: %default]')
@@ -90,7 +94,8 @@ def main():
 
   # initialize sequences coverage file
   seqs_cov_open = h5py.File(seqs_cov_file, 'w')
-  seqs_cov_open.create_dataset('targets', shape=(num_seqs, target_length), dtype='float16')
+  # seqs_cov_open.create_dataset('targets', shape=(num_seqs, target_length), dtype='float16')
+  targets_list = []
 
   # open genome coverage file
   genome_cov_open = CovFace(genome_cov_file)
@@ -104,11 +109,14 @@ def main():
 
     # interpolate NaN
     if options.interp_nan:
-        seq_cov_nt = interp_nan(seq_cov_nt)
+      seq_cov_nt = interp_nan(seq_cov_nt)
 
     # determine baseline coverage
-    baseline_cov = np.percentile(seq_cov_nt, 10)
-    baseline_cov = np.nan_to_num(baseline_cov)
+    if target_length >= 8:
+      baseline_cov = np.percentile(seq_cov_nt, 10)
+      baseline_cov = np.nan_to_num(baseline_cov)
+    else:
+      baseline_cov = 0
 
     # set blacklist to baseline
     if mseq.chr in black_chr_trees:
@@ -120,8 +128,8 @@ def main():
 
     # set NaN's to baseline
     if not options.interp_nan:
-        nan_mask = np.isnan(seq_cov_nt)
-        seq_cov_nt[nan_mask] = baseline_cov
+      nan_mask = np.isnan(seq_cov_nt)
+      seq_cov_nt[nan_mask] = baseline_cov
 
     # crop
     if options.crop_bp > 0:
@@ -134,27 +142,36 @@ def main():
     elif options.sum_stat in ['mean', 'avg']:
       seq_cov = seq_cov.mean(axis=1, dtype='float32')
     elif options.sum_stat == 'median':
-      seq_cov = seq_cov.median(axis=1, dtype='float32')
+      seq_cov = seq_cov.median(axis=1)
     elif options.sum_stat == 'max':
-      seq_cov = seq_cov.max(axis=1, dtype='float32')
+      seq_cov = seq_cov.max(axis=1)
+    elif options.sum_stat == 'peak':
+      seq_cov = seq_cov.mean(axis=1, dtype='float32')
+      seq_cov = np.clip(np.sqrt(seq_cov*4), 0, 1)
     else:
       print('ERROR: Unrecognized summary statistic "%s".' % options.sum_stat,
             file=sys.stderr)
       exit(1)
 
     # clip
+    if options.clip_soft is not None:
+      clip_mask = (seq_cov > options.clip_soft)
+      seq_cov[clip_mask] = options.clip_soft + np.sqrt(seq_cov[clip_mask] - options.clip_soft)
     if options.clip is not None:
-      if options.soft_clip:
-        clip_mask = (seq_cov > options.clip)
-        seq_cov[clip_mask] = options.clip + np.sqrt(seq_cov[clip_mask] - options.clip)
-      else:
         seq_cov = np.clip(seq_cov, 0, options.clip)
 
     # scale
     seq_cov = options.scale * seq_cov
 
+    # save
+    targets_list.append(seq_cov.astype('float16'))
+
     # write
-    seqs_cov_open['targets'][si,:] = seq_cov.astype('float16')
+    # seqs_cov_open['targets'][si,:] = seq_cov.astype('float16')
+
+  # write all
+  seqs_cov_open.create_dataset('targets', dtype='float16',
+    data=np.array(targets_list, dtype='float16'))
 
   # close genome coverage file
   genome_cov_open.close()
@@ -164,33 +181,33 @@ def main():
 
 
 def interp_nan(x, kind='linear'):
-    '''Linearly interpolate to fill NaN.'''
+  '''Linearly interpolate to fill NaN.'''
 
-    # pad zeroes
-    xp = np.zeros(len(x)+2)
-    xp[1:-1] = x
+  # pad zeroes
+  xp = np.zeros(len(x)+2)
+  xp[1:-1] = x
 
-    # find NaN
-    x_nan = np.isnan(xp)
+  # find NaN
+  x_nan = np.isnan(xp)
 
-    if np.sum(x_nan) == 0:
-        # unnecessary
-        return x
+  if np.sum(x_nan) == 0:
+    # unnecessary
+    return x
 
-    else:
-        # interpolate
-        inds = np.arange(len(xp))
-        interpolator = scipy.interpolate.interp1d(
-            inds[~x_nan],
-            xp[~x_nan],
-            kind=kind,
-            bounds_error=False)
+  else:
+    # interpolate
+    inds = np.arange(len(xp))
+    interpolator = scipy.interpolate.interp1d(
+        inds[~x_nan],
+        xp[~x_nan],
+        kind=kind,
+        bounds_error=False)
 
-        loc = np.where(x_nan)
-        xp[loc] = interpolator(loc)
+    loc = np.where(x_nan)
+    xp[loc] = interpolator(loc)
 
-        # slice off pad
-        return xp[1:-1]
+    # slice off pad
+    return xp[1:-1]
 
 def read_blacklist(blacklist_bed, black_buffer=20):
   """Construct interval trees of blacklist
@@ -216,32 +233,70 @@ class CovFace:
   def __init__(self, cov_file):
     self.cov_file = cov_file
     self.bigwig = False
+    self.bed = False
 
     cov_ext = os.path.splitext(self.cov_file)[1].lower()
-    if cov_ext in ['.bw','.bigwig']:
+    if cov_ext == '.gz':
+      cov_ext = os.path.splitext(self.cov_file[:-3])[1].lower()
+
+    if cov_ext in ['.bed', '.narrowpeak']:
+      self.bed = True
+      self.preprocess_bed()
+
+    elif cov_ext in ['.bw','.bigwig']:
       self.cov_open = pyBigWig.open(self.cov_file, 'r')
       self.bigwig = True
+
     elif cov_ext in ['.h5', '.hdf5', '.w5', '.wdf5']:
       self.cov_open = h5py.File(self.cov_file, 'r')
+
     else:
       print('Cannot identify coverage file extension "%s".' % cov_ext,
             file=sys.stderr)
       exit(1)
 
+  def preprocess_bed(self):
+    # read BED
+    bed_df = pd.read_csv(self.cov_file, sep='\t',
+      usecols=range(3), names=['chr','start','end'])
+
+    # for each chromosome
+    self.cov_open = {}
+    for chrm in bed_df.chr.unique():
+      bed_chr_df = bed_df[bed_df.chr==chrm]
+
+      # find max pos
+      pos_max = bed_chr_df.end.max()
+
+      # initialize array
+      self.cov_open[chrm] = np.zeros(pos_max, dtype='bool')
+
+      # set peaks
+      for peak in bed_chr_df.itertuples():
+        self.cov_open[peak.chr][peak.start:peak.end] = 1
+
+
   def read(self, chrm, start, end):
     if self.bigwig:
       cov = self.cov_open.values(chrm, start, end, numpy=True).astype('float16')
+
     else:
       if chrm in self.cov_open:
         cov = self.cov_open[chrm][start:end]
+        pad_zeros = end-start-len(cov)
+        if pad_zeros > 0:
+          cov_pad = np.zeros(pad_zeros, dtype='bool')
+          cov = np.concatenate([cov, cov_pad])
       else:
         print("WARNING: %s doesn't see %s:%d-%d. Setting to all zeros." % \
           (self.cov_file, chrm, start, end), file=sys.stderr)
         cov = np.zeros(end-start, dtype='float16')
+
     return cov
 
   def close(self):
-    self.cov_open.close()
+    if not self.bed:
+      self.cov_open.close()
 
 ################################################################################
 # __main__

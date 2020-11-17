@@ -23,11 +23,9 @@ from natsort import natsorted
 import numpy as np
 import tensorflow as tf
 
-
 # TFRecord constants
 TFR_INPUT = 'sequence'
 TFR_OUTPUT = 'target'
-
 
 def file_to_records(filename):
   return tf.data.TFRecordDataset(filename, compression_type='ZLIB')
@@ -73,11 +71,11 @@ class SeqDataset:
     with open(data_stats_file) as data_stats_open:
       data_stats = json.load(data_stats_open)
     self.seq_length = data_stats['seq_length']
-
-    self.seq_depth = data_stats.get('seq_depth', 4)
+    
+    self.seq_depth = data_stats.get('seq_depth',4)
     self.target_length = data_stats['target_length']
     self.num_targets = data_stats['num_targets']
-
+    
     if self.tfr_pattern is None:
       self.tfr_path = '%s/tfrecords/%s-*.tfr' % (self.data_dir, self.split_label)
       self.num_seqs = data_stats['%s_seqs' % self.split_label]
@@ -112,7 +110,7 @@ class SeqDataset:
         sequence = tf.reshape(sequence, [self.seq_length, self.seq_depth])
         if self.seq_length_crop is not None:
           crop_len = (self.seq_length - self.seq_length_crop) // 2
-          sequence = sequence[crop_len:-crop_len, :]
+          sequence = sequence[crop_len:-crop_len,:]
         sequence = tf.cast(sequence, tf.float32)
 
       # decode targets
@@ -143,12 +141,12 @@ class SeqDataset:
 
       # interleave files
       dataset = dataset.interleave(map_func=file_to_records,
-                                   cycle_length=cycle_length,
-                                   num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        cycle_length=cycle_length,
+        num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
       # shuffle
       dataset = dataset.shuffle(buffer_size=self.shuffle_buffer,
-                                reshuffle_each_iteration=True)
+        reshuffle_each_iteration=True)
 
     # valid/test
     else:
@@ -173,6 +171,7 @@ class SeqDataset:
     # hold on
     self.dataset = dataset
 
+
   def compute_stats(self):
     """ Iterate over the TFRecords to count sequences, and infer
         seq_depth and num_targets."""
@@ -190,19 +189,19 @@ class SeqDataset:
     # for (seq_raw, genome), targets_raw in dataset:
     for seq_raw, targets_raw in dataset:
       # infer seq_depth
-      seq_1hot = seq_raw.numpy().reshape((self.seq_length, -1))
+      seq_1hot = seq_raw.numpy().reshape((self.seq_length,-1))
       if self.seq_depth is None:
         self.seq_depth = seq_1hot.shape[-1]
       else:
-        assert (self.seq_depth == seq_1hot.shape[-1])
+        assert(self.seq_depth == seq_1hot.shape[-1])
 
       # infer num_targets
-      targets1 = targets_raw.numpy().reshape(self.target_length, -1)
+      targets1 = targets_raw.numpy().reshape(self.target_length,-1)
       if self.num_targets is None:
         self.num_targets = targets1.shape[-1]
         targets_nonzero = ((targets1 != 0).sum(axis=0) > 0)
       else:
-        assert (self.num_targets == targets1.shape[-1])
+        assert(self.num_targets == targets1.shape[-1])
         targets_nonzero = np.logical_or(targets_nonzero, (targets1 != 0).sum(axis=0) > 0)
 
       # count sequences
@@ -211,11 +210,11 @@ class SeqDataset:
     # warn user about nonzero targets
     if self.num_seqs > 0:
       self.num_targets_nonzero = (targets_nonzero > 0).sum()
-      print('%s has %d sequences with %d/%d targets' % (
-      self.tfr_path, self.num_seqs, self.num_targets_nonzero, self.num_targets), flush=True)
+      print('%s has %d sequences with %d/%d targets' % (self.tfr_path, self.num_seqs, self.num_targets_nonzero, self.num_targets), flush=True)
     else:
       self.num_targets_nonzero = None
       print('%s has %d sequences with 0 targets' % (self.tfr_path, self.num_seqs), flush=True)
+
 
   def numpy(self, return_inputs=True, return_outputs=True, step=1):
     """ Convert TFR inputs and/or outputs to numpy arrays."""
@@ -241,18 +240,18 @@ class SeqDataset:
     for seq_raw, targets_raw in dataset:
       # sequence
       if return_inputs:
-        seq_1hot = seq_raw.numpy().reshape((self.seq_length, -1))
+        seq_1hot = seq_raw.numpy().reshape((self.seq_length,-1))
         if self.seq_length_crop is not None:
           crop_len = (self.seq_length - self.seq_length_crop) // 2
-          seq_1hot = seq_1hot[crop_len:-crop_len, :]
+          seq_1hot = seq_1hot[crop_len:-crop_len,:]
         seqs_1hot.append(seq_1hot)
 
       # targets
       if return_outputs:
-        targets1 = targets_raw.numpy().reshape((self.target_length, -1))
+        targets1 = targets_raw.numpy().reshape((self.target_length,-1))
         if step > 1:
           step_i = np.arange(0, self.target_length, step)
-          targets1 = targets1[step_i, :]
+          targets1 = targets1[step_i,:]
         targets.append(targets1)
 
     # make arrays

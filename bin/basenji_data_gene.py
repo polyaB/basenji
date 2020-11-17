@@ -6,6 +6,7 @@ import pdb
 import random
 import sys
 
+from intervaltree import IntervalTree
 import networkx as nx
 import numpy as np
 import pysam
@@ -27,11 +28,16 @@ Write TF Records for gene TSS with expression measurements.
 def main():
   usage = 'usage: %prog [options] <fasta> <tss_gff> <expr_file>'
   parser = OptionParser(usage)
+  parser.add_option('-b', dest='split_bed',
+      default=None, help='BED file to restrict data splitting.')
   parser.add_option('-c', dest='cluster_gene_distance',
-      default=1000, type='int',
+      default=2000, type='int',
       help='Cluster genes into the same split within this distance [Default: %default]')
+  parser.add_option('-f', dest='folds',
+      default=None, type='int',
+      help='Generate cross fold split [Default: %default]')
   parser.add_option('-g', dest='gene_index',
-      default='gene_name',
+      default='gene_id',
       help='Key to match TSS GFF to expression table [Default: %default]')
   parser.add_option('-l', dest='seq_length',
       default=65536, type='int',
@@ -48,10 +54,10 @@ def main():
       default=False, action='store_true',
       help='Square root the expression values [Default: %default]')
   parser.add_option('-t', dest='test_pct_or_chr',
-      default=0.05, type='str',
+      default=0.1, type='str',
       help='Proportion of the data for testing [Default: %default]')
   parser.add_option('-v', dest='valid_pct_or_chr',
-      default=0.05, type='str',
+      default=0.1, type='str',
       help='Proportion of the data for validation [Default: %default]')
   (options, args) = parser.parse_args()
 
@@ -71,53 +77,88 @@ def main():
   ################################################################
   # read genes and targets
 
-  genes_df = gff_df(tss_gff_file, options.gene_index)
-  expr_df = pd.read_csv(expr_file, index_col=0)
+  genes_raw_df = gff_df(tss_gff_file, options.gene_index)
+  expr_raw_df = pd.read_csv(expr_file, index_col=0)
+  if options.sqrt:
+    expr_raw_df = np.sqrt(expr_raw_df)
 
   # filter for shared genes
-  shared_genes = set(genes_df.index) & set(expr_df.index)
+  shared_genes = set(genes_raw_df.index) & set(expr_raw_df.index)
+  shared_genes = sorted(shared_genes)
   print('Shared %d genes of %d described and %d quantified' %  \
-    (len(shared_genes), genes_df.shape[0], expr_df.shape[0]))
+    (len(shared_genes), genes_raw_df.shape[0], expr_raw_df.shape[0]))
 
-  genes_mask = np.array([gene in shared_genes for gene in genes_df.index])
-  genes_df = genes_df.loc[genes_mask].copy()
-  expr_mask = np.array([gene in shared_genes for gene in expr_df.index])
-  expr_df = expr_df.loc[expr_mask].copy()
+  # align gene info and expression
+  genes_df = genes_raw_df.loc[shared_genes]
+  expr_df = expr_raw_df.loc[shared_genes]
+  assert(genes_df.shape[0] == expr_df.shape[0])
 
-  if options.sqrt:
-    expr_df = np.sqrt(expr_df)
+  ################################################################
+  # filter genes from chromosome ends
+
+  gene_valid_mask = sufficient_sequence(fasta_file, genes_df, 
+      options.seq_length, options.n_allowed_pct)
+  genes_df = genes_df.loc[gene_valid_mask]
+  expr_df = expr_df.loc[gene_valid_mask]
 
   ################################################################
   # divide between train/valid/test
 
   # permute genes
-  genes_df = genes_df.sample(frac=1)
-  
-  try:
-    # convert to float pct
-    valid_pct = float(options.valid_pct_or_chr)
-    test_pct = float(options.test_pct_or_chr)
-    assert(0 <= valid_pct <= 1)
-    assert(0 <= test_pct <= 1)
+  np.random.seed(44)
+  permute_order = np.random.permutation(genes_df.shape[0])
+  genes_df = genes_df.iloc[permute_order]
+  expr_df = expr_df.iloc[permute_order]
+  assert((genes_df.index == expr_df.index).all())
 
-    # divide by pct
-    tvt_indexes = divide_genes_pct(genes_df, test_pct, valid_pct, options.cluster_gene_distance)
+  if options.folds is not None:
+    if options.split_bed is None:
+      fold_indexes = divide_genes_folds(genes_df, options.folds,
+                                        options.cluster_gene_distance)
+    else:
+      fold_indexes = divide_genes_folds_bed(genes_df, options.split_bed,
+                                            options.cluster_gene_distance)
 
-  except (ValueError, AssertionError):
-    # divide by chr
-    valid_chrs = options.valid_pct_or_chr.split(',')
-    test_chrs = options.test_pct_or_chr.split(',')
-    tvt_indexes = divide_genes_chr(genes_df, test_chrs, valid_chrs)
+  else:
+    try:
+      # convert to float pct
+      valid_pct = float(options.valid_pct_or_chr)
+      test_pct = float(options.test_pct_or_chr)
+      assert(0 <= valid_pct <= 1)
+      assert(0 <= test_pct <= 1)
 
-  # write gene sets
-  train_index, valid_index, test_index = tvt_indexes
-  genes_df.iloc[train_index].to_csv('%s/genes_train.csv' % options.out_dir, sep='\t')
-  genes_df.iloc[valid_index].to_csv('%s/genes_valid.csv' % options.out_dir, sep='\t')
-  genes_df.iloc[test_index].to_csv('%s/genes_test.csv' % options.out_dir, sep='\t')
+      # divide by pct
+      fold_indexes = divide_genes_pct(genes_df, test_pct, valid_pct, options.cluster_gene_distance)
+
+    except (ValueError, AssertionError):
+      # divide by chr
+      valid_chrs = options.valid_pct_or_chr.split(',')
+      test_chrs = options.test_pct_or_chr.split(',')
+      fold_indexes = divide_genes_chr(genes_df, test_chrs, valid_chrs)
+
+  # label folds
+  if options.folds is not None:
+    fold_labels = ['fold%d' % fi for fi in range(options.folds)]
+    num_folds = options.folds
+  else:
+    fold_labels = ['train', 'valid', 'test']
+    num_folds = 3
+
+  # write genes BED
+  genes_bed_file = '%s/genes.bed' % options.out_dir
+  genes_bed_open = open(genes_bed_file, 'w')
+  for fi in range(num_folds):
+    for gi in fold_indexes[fi]:
+      gene = genes_df.iloc[gi]
+      name_col = '%s;%s' % (gene.name, fold_labels[fi])
+      cols = [gene.chr, str(gene.start), str(gene.end), name_col, '.', gene.strand]
+      print('\t'.join(cols), file=genes_bed_open)
+  genes_bed_open.close()
 
   # write targets
+  descriptions = ['RNA:%s' % label for label in expr_df.columns]
   targets_df = pd.DataFrame({'identifier':expr_df.columns,
-                             'description': expr_df.columns})
+                             'description':descriptions})
   targets_df.index.name = 'index'
   targets_df.to_csv('%s/targets.txt' % options.out_dir, sep='\t')
 
@@ -131,21 +172,23 @@ def main():
   fasta_open = pysam.Fastafile(fasta_file)
 
   # define options
-  tf_opts = tf.io.TFRecordOptions('ZLIB')
+  tf_opts = tf.io.TFRecordOptions(compression_type='ZLIB')
 
-  tvt_tuples = [('train',train_index), ('valid',valid_index), ('test',test_index)]
-  for set_label, set_index in tvt_tuples:
-    genes_set_df = genes_df.iloc[set_index].copy()
-    expr_set_df = expr_df.iloc[set_index].copy()
+  for fi in range(num_folds):
+    genes_set_df = genes_df.iloc[fold_indexes[fi]]
+    expr_set_df = expr_df.iloc[fold_indexes[fi]]
 
     num_set = genes_set_df.shape[0]
     num_set_tfrs = int(np.ceil(num_set / options.seqs_per_tfr))
 
+    # gene sequence index
     si = 0
+
     for tfr_i in range(num_set_tfrs):
-      tfr_file = '%s/%s-%d.tfr' % (tfr_dir, set_label, tfr_i)
+      tfr_file = '%s/%s-%d.tfr' % (tfr_dir, fold_labels[fi], tfr_i)
       print(tfr_file)
       with tf.io.TFRecordWriter(tfr_file, tf_opts) as writer:
+        # TFR index
         ti = 0
         while ti < options.seqs_per_tfr and si < num_set:
           gene = genes_set_df.iloc[si]
@@ -154,49 +197,42 @@ def main():
           seq_start = mid_pos - options.seq_length//2
           seq_end = seq_start + options.seq_length
 
-          # left over
           if seq_start < 0:
+            # fill left side first
             n_requested = -seq_start
-            if n_requested/options.seq_length < options.n_allowed_pct:
-              seq_dna = ''.join([random.choice('ACGT') for i in range(n_requested)])
-              seq_dna += fasta_open.fetch(seq_chrm, 0, seq_end)
-              print('Allowing %s with %d left Ns' % (gene.name, n_requested))
-            else:
-              seq_dna = ''
+            seq_dna = ''.join([random.choice('ACGT') for i in range(n_requested)])
+            seq_dna += fasta_open.fetch(seq_chrm, 0, seq_end)
           else:
             seq_dna = fasta_open.fetch(seq_chrm, seq_start, seq_end)
 
-          # right over
-          if len(seq_dna) < options.seq_length:
-            if len(seq_dna) > 0:
-              n_requested = options.seq_length - len(seq_dna)
-            if n_requested/options.seq_length < options.n_allowed_pct:
-              seq_dna += ''.join([random.choice('ACGT') for i in range(n_requested)])
-              print('Allowing %s with %d right Ns' % (gene.name, n_requested))
-            else:
-              print('Skipping %s with %d Ns' % (gene.name, n_requested))
+          # fill out right side          
+          if len(seq_dna) > 0:
+            n_requested = options.seq_length - len(seq_dna)
+            seq_dna += ''.join([random.choice('ACGT') for i in range(n_requested)])
+
+          # verify length
+          assert(len(seq_dna) == options.seq_length)
+
+          # orient
+          if gene.strand == '-':
+            seq_dna = rc(seq_dna)
+
+          # one hot code
+          seq_1hot = dna_1hot(seq_dna)
+
+          # get targets
+          targets = expr_set_df.iloc[si].values
+          targets = targets.reshape((1,-1)).astype('float16')
+          
+          # make example
+          example = tf.train.Example(features=tf.train.Features(feature={
+            'sequence': _bytes_feature(seq_1hot.flatten().tostring()),
+            'target': _bytes_feature(targets.flatten().tostring())}))
 
           # write
-          if len(seq_dna) == options.seq_length:
-            if gene.strand == '-':
-              seq_dna = rc(seq_dna)
+          writer.write(example.SerializeToString())
 
-            # one hot code
-            seq_1hot = dna_1hot(seq_dna)
-
-            # get targets
-            targets = expr_set_df.iloc[si].values
-            targets = targets.reshape((1,-1))
-            targets = targets.astype('float16')
-
-            # make example
-            example = tf.train.Example(features=tf.train.Features(feature={
-              'sequence': _bytes_feature(seq_1hot.flatten().tostring()),
-              'target': _bytes_feature(targets.flatten().tostring())}))
-
-            # write
-            writer.write(example.SerializeToString())
-
+          # advance indexes
           ti += 1
           si += 1
 
@@ -207,11 +243,11 @@ def main():
 
   stats_dict = {}
   stats_dict['num_targets'] = targets_df.shape[0]
-  stats_dict['train_seqs'] = len(train_index)
-  stats_dict['valid_seqs'] = len(valid_index)
-  stats_dict['test_seqs'] = len(test_index)
   stats_dict['seq_length'] = options.seq_length
   stats_dict['target_length'] = 1
+
+  for fi in range(num_folds):
+    stats_dict['%s_seqs' % fold_labels[fi]] = len(fold_indexes[fi])
 
   with open('%s/statistics.json' % options.out_dir, 'w') as stats_json_out:
     json.dump(stats_dict, stats_json_out, indent=4)
@@ -251,7 +287,6 @@ def divide_genes_chr(genes_df, test_chrs, valid_chrs):
       (test_n, test_n/genes_n))
 
   return train_index, valid_index, test_index
-
 
 ################################################################################
 def cluster_genes(genes_df, cluster_gene_distance):
@@ -298,6 +333,130 @@ def cluster_genes(genes_df, cluster_gene_distance):
 
   return genes_graph
 
+################################################################################
+def divide_genes_folds(genes_df, folds, cluster_gene_distance):
+  """Divide genes uniformly into folds."""
+
+  # make gene graph
+  genes_graph = cluster_genes(genes_df, cluster_gene_distance)
+
+  # initialize fold gene lists
+  fold_size = np.zeros(folds)
+  fold_genes = []
+  for fi in range(folds):
+    fold_genes.append([])
+
+  # determine aimed genes/fold
+  num_genes = genes_df.shape[0]
+  fold_gene_aim = int(np.ceil(num_genes/folds))
+
+  # process connected componenets
+  for genes_cc in nx.connected_components(genes_graph):
+    # compute gap between current and aim
+    fold_gene_gap = fold_gene_aim - fold_size
+    fold_gene_gap = np.clip(fold_gene_gap, 0, np.inf)
+
+    # compute sample probability
+    fold_prob = fold_gene_gap / fold_gene_gap.sum()
+
+    # sample train/valid/test
+    fi = np.random.choice(folds, p=fold_prob)
+    fold_genes[fi] += genes_cc
+    fold_size[fi] += len(genes_cc)
+
+  print('Genes divided into')
+  for fi in range(folds):
+    print(' Fold%d: %5d genes, (%.4f)' % \
+      (fi, fold_size[fi], fold_size[fi]/num_genes))
+
+  return fold_genes
+
+################################################################################
+def divide_genes_folds_bed(genes_df, split_bed_file, cluster_gene_distance):
+  """Divide genes into folds according to an existing split."""
+
+  # make gene graph
+  genes_graph = cluster_genes(genes_df, cluster_gene_distance)
+
+  # create interval trees for existing splits
+  split_trees = {}
+  fold_labels = set()
+  for line in open(split_bed_file):
+    a = line.split()
+    chrm = a[0]
+    start = int(a[1])
+    end = int(a[2])
+    fold_label = a[3]
+    fold_labels.add(fold_label)
+    fold_index = int(fold_label.replace('fold',''))
+    if chrm not in split_trees:
+      split_trees[chrm] = IntervalTree()
+    split_trees[chrm][start:end] = fold_index
+
+  # initialize fold gene lists
+  folds = len(fold_labels)
+  fold_size = np.zeros(folds)
+  fold_genes = []
+  for fi in range(folds):
+    fold_genes.append([])
+
+  # determine aimed genes/fold
+  num_genes = genes_df.shape[0]
+  fold_gene_aim = int(np.ceil(num_genes/folds))
+
+  # process connected componenets
+  for genes_cc in nx.connected_components(genes_graph):
+    # maintain order with list
+    genes_cc = list(genes_cc)
+
+    # map genes to folds
+    genes_cc_splits = []
+    for gi in genes_cc:
+      gene = genes_df.iloc[gi]
+      if gene.chr not in split_trees:
+        genes_cc_splits.append(-1)
+      else:
+        split_intervals = list(split_trees[gene.chr][gene.start])
+        if len(split_intervals) == 0:
+          genes_cc_splits.append(-1)
+        elif len(split_intervals) == 1:
+          genes_cc_splits.append(split_intervals[0].data)
+        else:
+          print('Multiple overlapping contigs for gene.', file=sys.stderr)
+          exit(1)
+
+    # if component is unmapped    
+    genes_cc_splits_set = sorted(set(genes_cc_splits))
+    if len(genes_cc_splits_set) == 1 and genes_cc_splits_set[0] == -1:
+      # compute gap between current and aim
+      fold_gene_gap = fold_gene_aim - fold_size
+      fold_gene_gap = np.clip(fold_gene_gap, 0, np.inf)
+      
+      # sample split
+      # fi = np.random.choice(folds, p=fold_prob)
+      fi = np.argmax(fold_gene_gap)
+      fold_genes[fi] += genes_cc
+      fold_size[fi] += len(genes_cc)
+      print('Unmapped to fold%d' % fi)
+
+    else:
+      # map according to overlap
+      for ci, gi in enumerate(genes_cc):
+        fi = genes_cc_splits[ci]
+
+        # set unmapped to next split
+        if fi == -1:
+          fi = genes_cc_splits_set[1]
+
+        fold_genes[fi].append(gi)
+        fold_size[fi] += 1
+
+  print('Genes divided into')
+  for fi in range(folds):
+    print(' Fold%d: %5d genes, (%.4f)' % \
+      (fi, fold_size[fi], fold_size[fi]/num_genes))
+
+  return fold_genes
 
 ################################################################################
 def divide_genes_pct(genes_df, test_pct, valid_pct, cluster_gene_distance):
@@ -334,8 +493,17 @@ def divide_genes_pct(genes_df, test_pct, valid_pct, cluster_gene_distance):
   print(' Test:  %5d genes, (%.4f)' % \
       (test_n, test_n/genes_n))
 
-  return train_index, valid_index, test_index
+  return [train_index, valid_index, test_index]
 
+################################################################################
+def genes_bed(genes_df, bed_file):
+  """Write BED file representing gene sequencs."""
+  bed_open = open(bed_file, 'w')
+  for gene in genes_df.itertuples():
+    cols = [gene.chr, gene.start-1, gene.end]
+
+    # ...
+  bed_open.close()
 
 ################################################################################
 def gff_df(gff_file, gene_index):
@@ -351,7 +519,7 @@ def gff_df(gff_file, gene_index):
     chrms.append(a[0])
     starts.append(int(a[3]))
     ends.append(int(a[3]))
-    strands.append(a[5])
+    strands.append(a[6])
     for kv in gff.gtf_kv(a[-1]).items():
       gtf_lists.setdefault(kv[0],[]).append(kv[1])
 
@@ -368,6 +536,43 @@ def gff_df(gff_file, gene_index):
   df.set_index(gene_index, inplace=True)
 
   return df
+
+################################################################################
+def sufficient_sequence(fasta_file, genes_df, seq_length, n_allowed_pct):
+  """Return boolean mask specifying genes with sufficient sequence."""
+
+  # open FASTA
+  fasta_open = pysam.Fastafile(fasta_file)
+
+  # initialize gene boolean
+  gene_valid = np.ones(genes_df.shape[0], dtype='bool')
+
+  gi = 0
+  for gene in genes_df.itertuples():
+    chr_len = fasta_open.get_reference_length(gene.chr)
+    mid_pos = (gene.start + gene.end) // 2
+    seq_start = mid_pos - seq_length//2
+    seq_end = seq_start + seq_length
+
+    # count requested N's
+    n_requested = 0
+    if seq_start < 0:
+      n_requested += -seq_start
+    if seq_end > chr_len:
+      n_requested += seq_end - chr_len
+
+    if n_requested > 0:
+      if n_requested/seq_length < n_allowed_pct:                
+        print('Allowing %s with %d Ns' % (gene.Index, n_requested))
+      else:
+        print('Skipping %s with %d Ns' % (gene.Index, n_requested))
+        gene_valid[gi] = False
+
+    gi += 1
+
+  fasta_open.close()
+
+  return gene_valid
 
 
 def rc(seq):

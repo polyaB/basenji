@@ -31,9 +31,11 @@ from basenji import seqnn
 from basenji import trainer
 
 """
-basenji_train.py
+basenji_train2.py
 
-Train Basenji model using given parameters and data.
+Train Basenji model using given parameters and multiple genome datasets.
+
+DEPRACATED: Use basenji_train.py.
 """
 
 ################################################################################
@@ -51,11 +53,11 @@ def main():
       default=False, action='store_true',
       help='Restore only model trunk [Default: %default]')
   parser.add_option('--tfr_train', dest='tfr_train_pattern',
-      default='train-*.tfr',
-      help='Training TFRecord pattern string appended to data_dir [Default: %default]')
+      default=None,
+      help='Training TFR pattern string appended to data_dir/tfrecords for subsetting [Default: %default]')
   parser.add_option('--tfr_eval', dest='tfr_eval_pattern',
-      default='valid-*.tfr',
-      help='Evaluation TFRecord pattern string appended to data_dir [Default: %default]')
+      default=None,
+      help='Evaluation TFR pattern string appended to data_dir/tfrecords for subsetting [Default: %default]')
   (options, args) = parser.parse_args()
 
   if len(args) < 2:
@@ -66,6 +68,8 @@ def main():
 
   if not os.path.isdir(options.out_dir):
     os.mkdir(options.out_dir)
+  if params_file != '%s/params.json' % options.out_dir:
+    shutil.copy(params_file, '%s/params.json' % options.out_dir)
 
   # read model parameters
   with open(params_file) as params_open:
@@ -74,31 +78,23 @@ def main():
   params_train = params['train']
 
   # read datasets
-  data_stats = []
   train_data = []
   eval_data = []
 
   for data_dir in data_dirs:
-    # read data parameters
-    data_stats_file = '%s/statistics.json' % data_dir
-    with open(data_stats_file) as data_stats_open:
-      data_stats.append(json.load(data_stats_open))
-
     # load train data
-    tfr_train_full = '%s/tfrecords/%s' % (data_dir, options.tfr_train_pattern)
-    train_data.append(dataset.SeqDataset(tfr_train_full,
-      params_train['batch_size'],
-      params_model['seq_length'],
-      data_stats[-1]['target_length'],
-      tf.estimator.ModeKeys.TRAIN))
+    train_data.append(dataset.SeqDataset(data_dir,
+    split_label='train',
+    batch_size=params_train['batch_size'],
+    mode=tf.estimator.ModeKeys.TRAIN,
+    tfr_pattern=options.tfr_train_pattern))
 
     # load eval data
-    tfr_eval_full = '%s/tfrecords/%s' % (data_dir, options.tfr_eval_pattern)
-    eval_data.append(dataset.SeqDataset(tfr_eval_full,
-      params_train['batch_size'],
-      params_model['seq_length'],
-      data_stats[-1]['target_length'],
-      tf.estimator.ModeKeys.EVAL))
+    eval_data.append(dataset.SeqDataset(data_dir,
+    split_label='valid',
+    batch_size=params_train['batch_size'],
+    mode=tf.estimator.ModeKeys.EVAL,
+    tfr_pattern=options.tfr_eval_pattern))
 
   if params_train.get('num_gpu', 1) == 1:
     ########################################
@@ -125,8 +121,13 @@ def main():
     ########################################
     # two GPU
 
-    mirrored_strategy = tf.distribute.MirroredStrategy()
-    with mirrored_strategy.scope():
+    strategy = tf.distribute.MirroredStrategy()
+    with strategy.scope():
+
+      # distribute data
+      for di in range(len(data_dirs)):
+        train_data[di].distribute(strategy)
+        eval_data[di].distribute(strategy)
 
       # initialize model
       seqnn_model = seqnn.SeqNN(params_model)
@@ -136,14 +137,14 @@ def main():
         seqnn_model.restore(options.restore, options.trunk)
 
       # initialize trainer
-      seqnn_trainer = trainer.Trainer(params_train, train_data,
-                                      eval_data, options.out_dir)
+      seqnn_trainer = trainer.Trainer(params_train, train_data, eval_data,
+                                      options.out_dir, strategy, params_train['num_gpu'])
 
       # compile model
-      seqnn_trainer.compile(seqnn_model.model, None)
+      seqnn_trainer.compile(seqnn_model)
 
     # train model
-    seqnn_trainer.fit(seqnn_model.model)
+    seqnn_trainer.fit2(seqnn_model)
 
 ################################################################################
 # __main__
