@@ -79,7 +79,6 @@ def split_contigs(chrom_segments, gaps_file):
     chrom = a[0]
     gstart = int(a[1])
     gend = int(a[2])
-
     # consider only if its in our genome
     if chrom in chrom_events:
       chrom_events[chrom].append((gstart, 'gstart'))
@@ -110,6 +109,7 @@ def split_contigs(chrom_segments, gaps_file):
       elif event1 == 'gstart' and event2 == 'gend':
         pass
       else:
+        print(chrom, pos1, event1, pos2, event2)
         print(
             "I'm confused by this event ordering: %s - %s" % (event1, event2),
             file=sys.stderr)

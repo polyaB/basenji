@@ -150,7 +150,8 @@ class SeqNN():
     for ho in self.head_output:
       self.models.append(tf.keras.Model(inputs=sequence, outputs=ho))
     self.model = self.models[0]
-    with open("/mnt/storage/home/psbelokopytova/nn_anopheles/model_test", "w") as f:
+    #write model summary in file
+    with open("/mnt/storage/home/psbelokopytova/nn_anopheles/model_summary", "w") as f:
       self.model.summary(print_fn=lambda x: f.write(x + '\n'))
     # print(self.model.summary())
 

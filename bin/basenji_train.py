@@ -22,10 +22,38 @@ import shutil
 import sys
 import time
 
+seed_value= 0
+
+# 1. Set `PYTHONHASHSEED` environment variable at a fixed value
+import os
+os.environ['PYTHONHASHSEED']=str(seed_value)
+
+# 2. Set `python` built-in pseudo-random generator at a fixed value
+import random
+random.seed(seed_value)
+
+# 3. Set `numpy` pseudo-random generator at a fixed value
 import numpy as np
+np.random.seed(seed_value)
+
+# 4. Set the `tensorflow` pseudo-random generator at a fixed value
 import tensorflow as tf
+tf.random.set_seed(seed_value)
+# for later versions:
+# tf.compat.v1.set_random_seed(seed_value)
+
+# # 5. Configure a new global `tensorflow` session
+# from keras import backend as K
+# session_conf = tf.ConfigProto(intra_op_parallelism_threads=1, inter_op_parallelism_threads=1)
+# sess = tf.Session(graph=tf.get_default_graph(), config=session_conf)
+# K.set_session(sess)
+# for later versions:
+# session_conf = tf.compat.v1.ConfigProto(intra_op_parallelism_threads=1, inter_op_parallelism_threads=1)
+# sess = tf.compat.v1.Session(graph=tf.compat.v1.get_default_graph(), config=session_conf)
+# tf.compat.v1.keras.backend.set_session(sess)
 if tf.__version__[0] == '1':
   tf.compat.v1.enable_eager_execution()
+
 
 source_path = os.path.dirname(os.path.abspath(sys.argv[0])) + "/../"
 sys.path.append(source_path)
@@ -152,10 +180,12 @@ def main():
       seqnn_trainer.compile(seqnn_model)
 
   # train model
+  # print(options.keras_fit)
   if options.keras_fit:
     seqnn_trainer.fit_keras(seqnn_model)
   else:
     if len(data_dirs) == 1:
+      #print("im here")
       seqnn_trainer.fit_tape(seqnn_model)
     else:
       seqnn_trainer.fit2(seqnn_model)

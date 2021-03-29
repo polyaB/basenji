@@ -33,7 +33,7 @@ from cooltools.lib.numutils import observed_over_expected, adaptive_coarsegrain
 from cooltools.lib.numutils import interpolate_bad_singletons, set_diag, interp_nan
 from astropy.convolution import Gaussian2DKernel
 from astropy.convolution import convolve
-
+import matplotlib.pyplot as plt
 """
 akita_data_read.py
 
@@ -89,6 +89,7 @@ def main():
   model_seqs = []
   for line in open(seqs_bed_file):
     a = line.split()
+    print(a)
     model_seqs.append(ModelSeq(a[0],int(a[1]),int(a[2]),None))
 
   # read blacklist regions
@@ -133,7 +134,7 @@ def main():
       raise ValueError('invalid expected file')
    
   # check for "chr" prefix
-  chr_pre = 'chr1' in genome_hic_cool.chromnames
+  chr_pre = genome_hic_cool.chromnames[0].find('chr')
 
   # assert that resolution matches
   assert(options.pool_width == genome_hic_cool.info['bin-size'])
@@ -141,16 +142,15 @@ def main():
   # for each model sequence
   for si in range(num_seqs):
     mseq = model_seqs[si]
-
     try:
       # pull hic values
-      if chr_pre:
+      if chr_pre==-1:
         mseq_str = '%s:%d-%d' % (mseq.chr, mseq.start, mseq.end)
       else:
         mseq_str = '%s:%d-%d' % (mseq.chr[3:], mseq.start, mseq.end)
-      #print('mseq_str:', mseq_str)
-
       seq_hic_raw = genome_hic_cool.matrix(balance=True).fetch(mseq_str)
+      # print(mseq_str)
+      # print(seq_hic_raw.shape)
       seq_hic_nan = np.isnan(seq_hic_raw)
       num_filtered_bins = np.sum(np.sum(seq_hic_nan,axis=0) == len(seq_hic_nan))
       if num_filtered_bins > (.5*len(seq_hic_nan)):
@@ -172,6 +172,14 @@ def main():
         set_diag(seq_hic_raw, clipval, i)
       seq_hic_raw = np.clip(seq_hic_raw, 0, clipval)
       seq_hic_raw[seq_hic_nan] = np.nan
+      # picture_dir = '/mnt/scratch/ws/psbelokopytova/202103211631polina/nn_anopheles/dataset_like_Akita/data/Aaalb_2048_new2/'
+      # if mseq.chr == "X":
+      #   im = plt.matshow(seq_hic_raw, fignum=False, cmap='OrRd')#, vmax=vmax, vmin=vmin)
+      #   plt.colorbar(im, fraction=.04, pad=0.05)#, ticks=[-2, -1, 0, 1, 2])
+      #   plt.title('seq_hic_clip' + str(mseq_str), y=1.15)
+      #   plt.tight_layout()
+      #   plt.savefig(picture_dir + "_"+str(mseq.start)+"_"+str(mseq.end)+"_seq_hic_raw_clip.png")
+      #   plt.clf()
 
       # adaptively coarsegrain based on raw counts
       seq_hic_smoothed = adaptive_coarsegrain(
@@ -179,6 +187,13 @@ def main():
                               genome_hic_cool.matrix(balance=False).fetch(mseq_str),
                               cutoff=2, max_levels=8)
       seq_hic_nan = np.isnan(seq_hic_smoothed)
+      # if mseq.chr == "X":
+      #   im = plt.matshow(seq_hic_smoothed, fignum=False, cmap='OrRd')#, vmax=vmax, vmin=vmin)
+      #   plt.colorbar(im, fraction=.04, pad=0.05)#, ticks=[-2, -1, 0, 1, 2])
+      #   plt.title('seq_hic_coarsegrained' + str(mseq_str), y=1.15)
+      #   plt.tight_layout()
+      #   plt.savefig(picture_dir+"mseq.chr" + "_"+str(mseq.start)+"_"+str(mseq.end)+"_seq_hic_coarsegrained.png")
+      #   plt.clf()
       #todo: pass an option to add a certain pseudocount value, or the minimum nonzero value
 
       if options.as_obsexp:
@@ -211,11 +226,26 @@ def main():
           seq_hic_obsexp = interp_nan(seq_hic_obsexp)
           for i in range(-options.diagonal_offset+1, options.diagonal_offset): set_diag(seq_hic_obsexp, 1,i)
 
+        # if mseq.chr == "X":
+        #   im = plt.matshow(seq_hic_obsexp, fignum=False, cmap='RdBu_r')  # , vmax=vmax, vmin=vmin)
+        #   plt.colorbar(im, fraction=.04, pad=0.05)  # , ticks=[-2, -1, 0, 1, 2])
+        #   plt.title('seq_hic_oe_log' + str(mseq_str), y=1.15)
+        #   plt.tight_layout()
+        #   plt.savefig(picture_dir+mseq.chr + "_"+str(mseq.start)+"_"+str(mseq.end)+"_seq_hic_oe_log.png")
+        #   plt.clf()
         # apply kernel
         if kernel is not None:
           seq_hic = convolve(seq_hic_obsexp, kernel)
         else:
           seq_hic = seq_hic_obsexp
+
+        # if mseq.chr == "2L":
+          # im = plt.matshow(seq_hic, fignum=False, cmap='RdBu_r')  # , vmax=vmax, vmin=vmin)
+          # plt.colorbar(im, fraction=.04, pad=0.05)  # , ticks=[-2, -1, 0, 1, 2])
+          # plt.title('seq_hic_kernel' + str(mseq_str), y=1.15)
+          # plt.tight_layout()
+          # plt.savefig("/mnt/storage/home/psbelokopytova/nn_anopheles/test_normalization/mseq.chr" + "_"+str(mseq.start)+"_"+str(mseq.end)+"_seq_hic_kernel.png")
+          # plt.clf()
 
       else:
         # interpolate all missing bins
@@ -235,12 +265,21 @@ def main():
     except ValueError:
       print("WARNING: %s doesn't see %s. Setting to all zeros." % (genome_hic_file, mseq_str))
       seq_hic = np.zeros((seq_len_pool,seq_len_pool), dtype='float16')
-
+    # print(seq_hic.shape)
     # crop
     if options.crop_bp > 0:
       seq_hic = seq_hic[crop_start:crop_end,:]
       seq_hic = seq_hic[:,crop_start:crop_end]
+    # print(seq_hic.shape)
 
+    # if mseq.chr == "X":
+    #   im = plt.matshow(seq_hic, fignum=False, cmap='RdBu_r')  # , vmax=vmax, vmin=vmin)
+    #   plt.colorbar(im, fraction=.04, pad=0.05)  # , ticks=[-2, -1, 0, 1, 2])
+    #   plt.title('seq_hic_final' + str(mseq_str), y=1.15)
+    #   plt.tight_layout()
+    #   plt.savefig(picture_dir + mseq.chr+"_"+str(mseq.start)+"_"+str(mseq.end)+"_seq_hic_final.png")
+    #   plt.clf()
+    # exit(0)
     # unroll upper triangular
     seq_hic = seq_hic[triu_tup]
 
@@ -249,7 +288,6 @@ def main():
 
   # close sequences coverage file
   seqs_hic_open.close()
-
 ################################################################################
 # __main__
 ################################################################################

@@ -51,13 +51,11 @@ def dna_1hot(seq, seq_len=None, n_uniform=False):
       seq_start = (seq_len - len(seq)) // 2
 
   seq = seq.upper()
-
   # map nt's to a matrix len(seq)x4 of 0's and 1's.
   if n_uniform:
     seq_code = np.zeros((seq_len, 4), dtype='float16')
   else:
     seq_code = np.zeros((seq_len, 4), dtype='bool')
-    
   for i in range(seq_len):
     if i >= seq_start and i - seq_start < len(seq):
       nt = seq[i - seq_start]

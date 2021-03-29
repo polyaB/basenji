@@ -16,15 +16,41 @@
 import time
 from packaging import version
 import pdb
+seed_value= 0
+# 1. Set `PYTHONHASHSEED` environment variable at a fixed value
+import os
+os.environ['PYTHONHASHSEED']=str(seed_value)
 
+# 2. Set `python` built-in pseudo-random generator at a fixed value
+import random
+random.seed(seed_value)
+
+# 3. Set `numpy` pseudo-random generator at a fixed value
 import numpy as np
+np.random.seed(seed_value)
+
+# 4. Set the `tensorflow` pseudo-random generator at a fixed value
 import tensorflow as tf
+tf.random.set_seed(seed_value)
+# for later versions:
+# tf.compat.v1.set_random_seed(seed_value)
+
+# 5. Configure a new global `tensorflow` session
+# from keras import backend as K
+# session_conf = tf.ConfigProto(intra_op_parallelism_threads=1, inter_op_parallelism_threads=1)
+# sess = tf.Session(graph=tf.get_default_graph(), config=session_conf)
+# K.set_session(sess)
+# for later versions:
+session_conf = tf.compat.v1.ConfigProto(intra_op_parallelism_threads=1, inter_op_parallelism_threads=1)
+sess = tf.compat.v1.Session(graph=tf.compat.v1.get_default_graph(), config=session_conf)
+tf.compat.v1.keras.backend.set_session(sess)
 from tensorflow.python.ops import math_ops
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import dtypes
 
 from basenji import layers
 from basenji import metrics
+from basenji.draw_prediction_during_train import draw_pred_in_train
 
 def parse_loss(loss_label, strategy=None, keras_fit=True, spec_weight=1):
   """Parse loss function from label, strategy, and fitting method."""
@@ -52,6 +78,7 @@ class Trainer:
                strategy=None, num_gpu=1, keras_fit=True):
     self.params = params
     self.train_data = train_data
+    print(train_data)
     if type(self.train_data) is not list:
       self.train_data = [self.train_data]
     self.eval_data = eval_data
@@ -72,7 +99,7 @@ class Trainer:
     self.make_optimizer()
 
     # early stopping
-    self.patience = self.params.get('patience', 20)
+    self.patience = self.params.get('patience', 10000)
 
     # compute batches/epoch
     self.train_epoch_batches = [td.batches_per_epoch() for td in self.train_data]
@@ -116,12 +143,13 @@ class Trainer:
       save_best = tf.keras.callbacks.ModelCheckpoint('%s/model_best.h5'%self.out_dir,
                                                      save_best_only=True, mode='max',
                                                      monitor='val_pearsonr', verbose=1)
-
+    print("im here",self.out_dir )
     callbacks = [
       early_stop,
-      tf.keras.callbacks.TensorBoard(self.out_dir),
+      tf.keras.callbacks.TensorBoard(log_dir=self.out_dir),
       tf.keras.callbacks.ModelCheckpoint('%s/model_check.h5'%self.out_dir),
-      save_best]
+      save_best,
+      tf.keras.callbacks.History(self.out_dir)]
 
     seqnn_model.model.fit(
       self.train_data[0].dataset,
@@ -130,7 +158,10 @@ class Trainer:
       callbacks=callbacks,
       validation_data=self.eval_data[0].dataset,
       validation_steps=self.eval_epoch_batches[0])
-
+    # from plot_history import plot_history
+    # plot_history([('hist', hist)],
+    #              key='mean_squared_error',
+    #              file_name=self.out_dir + "/fitting_model_hist")
 
   def fit2(self, seqnn_model):
     if not self.compiled:
@@ -296,7 +327,7 @@ class Trainer:
     valid_loss = tf.keras.metrics.Mean(name='valid_loss')
     valid_r = metrics.PearsonR(num_targets, name='valid_r')
     valid_r2 = metrics.R2(num_targets, name='valid_r2')
-    
+    print("strategy", self.strategy)
     if self.strategy is None:
       @tf.function
       def train_step(x, y):
@@ -312,6 +343,8 @@ class Trainer:
       @tf.function
       def eval_step(x, y):
         pred = model(x, training=False)
+        print("pred_valid")
+        print(pred)
         loss = self.loss_fn(y, pred) + sum(model.losses)
         valid_loss(loss)
         valid_r(y, pred)
@@ -356,6 +389,9 @@ class Trainer:
     unimproved = 0
 
     # training loop
+    model_stat_file = open(self.out_dir + "/model_stat.txt", "w")
+    model_stat_file.write("epoch"+"\t"+ "train_loss_epoch"+"\t"+"train_r_epoch" + "\t"+"train_r2_epoch" + "\t"+
+                "valid_loss_epoch"+"\t"+"valid_r_epoch" + "\t"+"valid_r2_epoch"+"\n")
     for ei in range(self.train_epochs_max):
       if ei >= self.train_epochs_min and unimproved > self.patience:
         break
@@ -384,6 +420,8 @@ class Trainer:
         train_loss_epoch = train_loss.result().numpy()
         train_r_epoch = train_r.result().numpy()
         train_r2_epoch = train_r2.result().numpy()
+        model_stat_file.write(str(ei)+"\t"+str(train_loss_epoch)+"\t"+str(train_r_epoch)+"\t"+
+                              str(train_r2_epoch)+"\t")
         print('Epoch %d - %ds - train_loss: %.4f - train_r: %.4f - train_r2: %.4f' % \
           (ei, (time.time()-t0), train_loss_epoch, train_r_epoch, train_r2_epoch), end='')
 
@@ -392,11 +430,18 @@ class Trainer:
         valid_loss_epoch = valid_loss.result().numpy()
         valid_r_epoch = valid_r.result().numpy()
         valid_r2_epoch = valid_r2.result().numpy()
+        model_stat_file.write(str(valid_loss_epoch) + "\t" + str(valid_r_epoch) + "\t" +
+                              str(valid_r2_epoch) + "\n")
         print(' - valid_loss: %.4f - valid_r: %.4f - valid_r2: %.4f' % \
           (valid_loss_epoch, valid_r_epoch, valid_r2_epoch), end='')
 
         # checkpoint
         seqnn_model.save('%s/model_check.h5'%self.out_dir)
+        if ei%40 == 0:
+          draw_pred_in_train(model=seqnn_model, out_dir=self.out_dir, epoch=ei,
+                             loss=valid_loss_epoch, pearson_r=valid_r_epoch)
+          if ei%400 == 0:
+            seqnn_model.save(self.out_dir+"/model_check_epoch"+str(ei)+".h5")
 
         # check best
         if valid_r_epoch > valid_best:
@@ -415,7 +460,7 @@ class Trainer:
         valid_loss.reset_states()
         valid_r.reset_states()
         valid_r2.reset_states()
-
+    model_stat_file.close()
 
   def make_optimizer(self):
     # schedule (currently OFF)

@@ -90,7 +90,7 @@ def main():
       help='Continue progress from midpoint. [Default: %default]')
   parser.add_option('--sample', dest='sample_pct',
       default=1.0, type='float',
-      help='Down-sample the segments')
+      help='Down-sample the segmenDown-sample the segments')
   parser.add_option('--seed', dest='seed',
       default=44, type='int',
       help='Random seed [Default: %default]')
